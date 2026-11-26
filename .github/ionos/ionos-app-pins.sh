@@ -4,9 +4,11 @@
 #
 # Environment:
 #   GH_TOKEN, GITHUB_REPOSITORY   required (owner/name of this fork)
-#   BASE_BRANCH      branch to propose into, default ionos-dev-v$LINE
+#   HAS_SYNC_TOKEN   "true" when GH_TOKEN is the repository secret IONOS_SYNC_TOKEN. Pull requests
+#                    opened with the default GITHUB_TOKEN do not trigger workflows (no commit lint)
 #   LINE             release line, default 33
-#   BASE_RELEASE     optional tag like v33.0.10; default is the newest final release of LINE
+#   BASE_BRANCH      branch to propose into, default ionos-dev-v$LINE
+#   BASE_RELEASE     optional tag like v33.0.10 that overrides the release of BASE_BRANCH
 #   DRY_RUN          "true" to only print what would be created
 set -euo pipefail
 
@@ -20,47 +22,93 @@ LINE=${LINE:-33}
 BASE_BRANCH=${BASE_BRANCH:-$(dev_branch_for_line "$LINE")}
 BASE_RELEASE=${BASE_RELEASE:-}
 DRY_RUN=${DRY_RUN:-false}
+HAS_SYNC_TOKEN=${HAS_SYNC_TOKEN:-false}
 RELEASES_REPO=nextcloud-releases/server
+UPSTREAM_SERVER=nextcloud/server
 UPSTREAM_ORG=nextcloud
 
-# 1. Which release tag
+[[ $LINE =~ ^[0-9]+$ ]] || die "LINE '$LINE' is not a number"
+[[ $BASE_BRANCH =~ ^[A-Za-z0-9._/-]+$ && $BASE_BRANCH != *..* ]] || die "BASE_BRANCH '$BASE_BRANCH' contains characters that are not allowed in a branch name here"
+[ "$HAS_SYNC_TOKEN" = true ] || warn "IONOS_SYNC_TOKEN is not set, using the default GITHUB_TOKEN: a pull request opened with it does not trigger workflows, so the commit-lint check will not run on it. Store a fine-grained token as the repository secret IONOS_SYNC_TOKEN (see ionos-app-pins.md)."
+
+# The pins (lines "app sha") in the apps-upstream/ folder of a root tree of this fork.
+pins_in_root_tree() {
+  local root au
+  root=$(gh api "repos/$REPO/git/trees/$1")
+  au=$(jq -r '.tree[] | select(.path == "apps-upstream") | .sha' <<<"$root")
+  [ -n "$au" ] || return 0
+  gh api "repos/$REPO/git/trees/$au" | jq -r '.tree[] | select(.mode == "160000") | .path + " " + .sha'
+}
+
+# The base release of the dev branch, the way ionos-sync.sh finds it: the newest final tag of the
+# line (from upstream's server repository) that is an ancestor of the dev branch tip. Done through
+# the API: the tag's commit is compared with the tip, status ahead or identical means ancestor.
+base_release_of_dev_branch() {
+  local tips name type sha status t
+  local -A TYPE SHA
+  tips=$(gh_paginate '.[] | [(.ref | ltrimstr("refs/tags/")), .object.type, .object.sha] | @tsv' \
+    -X GET "repos/$UPSTREAM_SERVER/git/matching-refs/tags/v$LINE." -f per_page=100)
+  while IFS=$'\t' read -r name type sha; do
+    [ -n "$name" ] || continue
+    TYPE[$name]=$type; SHA[$name]=$sha
+  done <<<"$tips"
+  while read -r t; do
+    [ -n "$t" ] || continue
+    sha=${SHA[$t]}
+    if [ "${TYPE[$t]}" = tag ]; then   # annotated tag: dereference to the commit
+      sha=$(gh api "repos/$UPSTREAM_SERVER/git/tags/$sha" | jq -r 'select(.object.type == "commit") | .object.sha')
+    fi
+    [[ $sha =~ ^[0-9a-f]{40}$ ]] || die "tag $t of $UPSTREAM_SERVER does not point at a commit"
+    status=$(gh api -X GET "repos/$REPO/compare/$sha...$BASE_SHA" -f per_page=1 | jq -r .status) ||
+      die "cannot compare $t with $BASE_BRANCH"
+    case "$status" in
+      ahead | identical) echo "$t"; return 0 ;;
+    esac
+  done < <(printf '%s\n' "${!TYPE[@]}" | final_tags_newest_first "$LINE")
+  die "no final release tag of line $LINE is an ancestor of $BASE_BRANCH"
+}
+
+# 1. The tip of the dev branch, and which release tag to pin for
+TIP=$(gh api -X GET "repos/$REPO/commits" -f sha="$BASE_BRANCH" -f per_page=1) || die "cannot read branch $BASE_BRANCH of $REPO"
+BASE_SHA=$(jq -r '.[0].sha // empty' <<<"$TIP")
+ROOT_TREE=$(jq -r '.[0].commit.tree.sha // empty' <<<"$TIP")
+[[ $BASE_SHA =~ ^[0-9a-f]{40}$ && -n $ROOT_TREE ]] || die "branch $BASE_BRANCH of $REPO has no commits"
 if [ -z "$BASE_RELEASE" ]; then
-  BASE_RELEASE=$(gh api "repos/$RELEASES_REPO/releases?per_page=100" |
-    jq -r '.[] | select(.prerelease == false and .draft == false) | .tag_name' | newest_final_tag "$LINE")
-  [ -n "$BASE_RELEASE" ] || die "no final release of line $LINE found"
+  BASE_RELEASE=$(base_release_of_dev_branch)
 fi
 TAG=$BASE_RELEASE
 [[ $TAG =~ $(final_tag_re "$LINE") ]] || die "base release '$TAG' is not a final tag of line $LINE (vN.M.P)"
-log "release tag $TAG"
+log "release tag $TAG (base of $BASE_BRANCH)"
 
 # 2. Upstream's app list; apps that live in the fork's apps/ need no pin
 CONFIG=$(gh api -H 'Accept: application/vnd.github.raw+json' "repos/$RELEASES_REPO/contents/stable$LINE.json")
-BASE_SHA=$(gh api "repos/$REPO/git/ref/heads/$BASE_BRANCH" | jq -r .object.sha)
-ROOT_TREE=$(gh api "repos/$REPO/git/commits/$BASE_SHA" | jq -r .tree.sha)
 ROOT=$(gh api "repos/$REPO/git/trees/$ROOT_TREE")
-tree_sha() { jq -r --arg p "$1" '.tree[] | select(.path == $p) | .sha' <<<"$ROOT"; }
-APPS_TREE=$(tree_sha apps)
+APPS_TREE=$(jq -r '.tree[] | select(.path == "apps") | .sha' <<<"$ROOT")
 IN_TREE=$(gh api "repos/$REPO/git/trees/$APPS_TREE" | jq -r '.tree[] | select(.type == "tree") | .path')
 
 DESIRED=""
 while IFS=$'\t' read -r id repo; do
-  if grep -qx "$id" <<<"$IN_TREE"; then continue; fi
+  [ -n "$id$repo" ] || continue
+  # untrusted text from upstream: validate before any use
+  [[ $id =~ ^[a-z0-9_]+$ ]] || die "invalid app id $(printf '%q' "$id") in upstream's app list"
+  if grep -qxF -e "$id" <<<"$IN_TREE"; then continue; fi
   case "$repo" in
     "$UPSTREAM_ORG"/*) ;;
-    *) log "skipping $id: repository $repo is not under $UPSTREAM_ORG/"; continue ;;
+    *) log "skipping $id: repository is not under $UPSTREAM_ORG/"; continue ;;
   esac
-  sha=$(gh api "repos/$repo/git/ref/tags/$TAG" | jq -r 'select(.object.type == "commit") | .object.sha')
-  [[ $id =~ ^[a-z0-9_]+$ && $sha =~ ^[0-9a-f]{40}$ ]] || die "no commit found for $repo at tag $TAG"
+  [[ $repo =~ ^nextcloud/[A-Za-z0-9._-]+$ && $repo != */. && $repo != */.. ]] ||
+    die "invalid repository $(printf '%q' "$repo") for app $id in upstream's app list"
+  if ! ref=$(gh api "repos/$repo/git/ref/tags/$TAG" 2>&1); then
+    die "tag $TAG not found in $repo (app $id): upstream does not tag every listed app for this release"
+  fi
+  sha=$(jq -r 'select(.object.type == "commit") | .object.sha' <<<"$ref")
+  [[ $sha =~ ^[0-9a-f]{40}$ ]] || die "tag $TAG of $repo (app $id) does not point at a commit"
   DESIRED+="$id $sha $repo"$'\n'
 done < <(jq -r '.[] | [.id, .repo] | @tsv' <<<"$CONFIG")
+DESIRED=${DESIRED%$'\n'}
 
-# 3. Current pins on the base branch
-AU_TREE=$(tree_sha apps-upstream)
-CURRENT=""
-if [ -n "$AU_TREE" ]; then
-  CURRENT=$(gh api "repos/$REPO/git/trees/$AU_TREE" |
-    jq -r '.tree[] | select(.mode == "160000") | .path + " " + .sha')$'\n'
-fi
+# 3. Current pins on the dev branch
+CURRENT=$(pins_in_root_tree "$ROOT_TREE")
 
 # 4. The difference, as tree entries
 ENTRIES=$(jq -n --arg d "$DESIRED" --arg c "$CURRENT" '
@@ -72,17 +120,27 @@ ENTRIES=$(jq -n --arg d "$DESIRED" --arg c "$CURRENT" '
       | {path: ("apps-upstream/" + .key), mode: "160000", type: "commit", sha: null}) ]')
 
 # .gitmodules changes only when the set of apps changes (append new sections, drop removed ones)
+ids_of() { cut -d' ' -f1 <<<"$1" | grep -E '^[a-z0-9_]+$' | sort || true; }
 GITMODULES=""
-ADDED=$(comm -13 <(awk '{print $1}' <<<"$CURRENT" | sort) <(awk '{print $1}' <<<"$DESIRED" | sort))
-REMOVED=$(comm -23 <(awk '{print $1}' <<<"$CURRENT" | sort) <(awk '{print $1}' <<<"$DESIRED" | sort))
+ADDED=$(comm -13 <(ids_of "$CURRENT") <(ids_of "$DESIRED"))
+REMOVED=$(comm -23 <(ids_of "$CURRENT") <(ids_of "$DESIRED"))
 if [ -n "$ADDED$REMOVED" ]; then
-  GITMODULES=$(gh api -H 'Accept: application/vnd.github.raw+json' "repos/$REPO/contents/.gitmodules?ref=$BASE_SHA")
-  GITMODULES=$(awk -v removed="$REMOVED" '
-    BEGIN { n = split(removed, r, "\n"); for (i = 1; i <= n; i++) if (r[i] != "") drop["[submodule \"apps-upstream/" r[i] "\"]"] = 1 }
-    /^\[/ { skip = ($0 in drop) }
-    !skip { print }' <<<"$GITMODULES")
+  DROP=""
+  while read -r id; do
+    [ -n "$id" ] && DROP+="[submodule \"apps-upstream/$id\"]"$'\n'
+  done <<<"$REMOVED"
+  RAW=$(gh api -X GET -H 'Accept: application/vnd.github.raw+json' "repos/$REPO/contents/.gitmodules" -f ref="$BASE_SHA")
+  skip=0
+  while IFS= read -r line; do
+    if [[ $line == '['* ]]; then
+      skip=0
+      if grep -qxF -e "$line" <<<"$DROP"; then skip=1; fi
+    fi
+    if [ "$skip" -eq 0 ]; then GITMODULES+="$line"$'\n'; fi
+  done <<<"$RAW"
   while read -r id _ repo; do
-    if grep -qx "$id" <<<"$ADDED"; then
+    [ -n "$id" ] || continue
+    if grep -qxF -e "$id" <<<"$ADDED"; then
       GITMODULES+=$'\n'"[submodule \"apps-upstream/$id\"]"$'\n'$'\t'"path = apps-upstream/$id"$'\n'$'\t'"url = https://github.com/$repo.git"
     fi
   done <<<"$DESIRED"
@@ -97,24 +155,39 @@ if [ "$(jq length <<<"$ENTRIES")" -eq 0 ]; then
 fi
 log "changes: $(jq -c '[.[] | .path]' <<<"$ENTRIES")"
 
-# 5. Idempotency: never a second branch or pull request for the same tag
-if gh api "repos/$REPO/git/ref/heads/$BRANCH" >/dev/null 2>&1; then
-  log "branch $BRANCH already exists; nothing to do"
+# 5. Idempotency: an open pull request is never touched; an existing branch with the same pins
+#    is left alone; an existing branch with other pins is refreshed.
+OWNER=${REPO%%/*}
+OPEN=$(gh api -X GET "repos/$REPO/pulls" -f state=open -f head="$OWNER:$BRANCH" -f base="$BASE_BRANCH" | jq -r '.[0].number // empty')
+if [ -n "$OPEN" ]; then
+  log "pull request #$OPEN for $BRANCH is already open; leaving it alone"
   exit 0
 fi
-OWNER=${REPO%%/*}
-OPEN=$(gh api "repos/$REPO/pulls?state=open&head=$OWNER:$BRANCH&base=$BASE_BRANCH" | jq -r '.[0].number // empty')
-if [ -n "$OPEN" ]; then
-  log "pull request #$OPEN for $BRANCH is already open; nothing to do"
-  exit 0
+REFRESH=false
+BRANCH_SHA=""
+if out=$(gh api "repos/$REPO/git/ref/heads/$BRANCH" 2>&1); then
+  BRANCH_SHA=$(jq -r .object.sha <<<"$out")
+  BRANCH_TREE=$(gh api "repos/$REPO/git/commits/$BRANCH_SHA" | jq -r .tree.sha)
+  if [ "$(pins_in_root_tree "$BRANCH_TREE" | sort)" = "$(sort <<<"$DESIRED" | cut -d' ' -f1,2)" ]; then
+    log "branch $BRANCH already exists with these pins; nothing to do"
+    exit 0
+  fi
+  REFRESH=true
+  log "branch $BRANCH already exists with other pins; it will be updated"
+elif [[ $out != *"HTTP 404"* ]]; then
+  die "cannot look up branch $BRANCH: $out"
 fi
 
 if [ "$DRY_RUN" = true ]; then
-  log "dry run: would open $BRANCH with the changes above and the title: $TITLE"
+  if [ "$REFRESH" = true ]; then
+    log "dry run: would update $BRANCH with the changes above, then open a pull request titled: $TITLE"
+  else
+    log "dry run: would open $BRANCH with the changes above and the title: $TITLE"
+  fi
   exit 0
 fi
 
-# 6. Create branch, commit and pull request
+# 6. Create the commit, then create or update the branch, then open the pull request
 if [ -n "$GITMODULES" ]; then
   BLOB=$(jq -n --arg c "$GITMODULES" '{content: $c, encoding: "utf-8"}' |
     gh api --method POST "repos/$REPO/git/blobs" --input - | jq -r .sha)
@@ -124,8 +197,18 @@ TREE=$(jq -n --arg base "$ROOT_TREE" --argjson e "$ENTRIES" '{base_tree: $base, 
   gh api --method POST "repos/$REPO/git/trees" --input - | jq -r .sha)
 COMMIT=$(jq -n --arg m "$TITLE" --arg t "$TREE" --arg p "$BASE_SHA" '{message: $m, tree: $t, parents: [$p]}' |
   gh api --method POST "repos/$REPO/git/commits" --input - | jq -r .sha)
-jq -n --arg r "refs/heads/$BRANCH" --arg s "$COMMIT" '{ref: $r, sha: $s}' |
-  gh api --method POST "repos/$REPO/git/refs" --input - >/dev/null
+if [ "$REFRESH" = true ]; then
+  # The API has no compare-and-swap: re-read the branch right before moving it and give up when
+  # somebody pushed to it since we looked (a best-effort lease).
+  NOW=$(gh api "repos/$REPO/git/ref/heads/$BRANCH" | jq -r .object.sha)
+  [ "$NOW" = "$BRANCH_SHA" ] || die "branch $BRANCH moved while the helper ran; not overwriting it"
+  jq -n --arg s "$COMMIT" '{sha: $s, force: true}' |
+    gh api --method PATCH "repos/$REPO/git/refs/heads/$BRANCH" --input - >/dev/null
+  log "updated $BRANCH to $COMMIT"
+else
+  jq -n --arg r "refs/heads/$BRANCH" --arg s "$COMMIT" '{ref: $r, sha: $s}' |
+    gh api --method POST "repos/$REPO/git/refs" --input - >/dev/null
+fi
 URL=$(jq -n --arg t "$TITLE" --arg h "$BRANCH" --arg b "$BASE_BRANCH" \
   '{title: $t, head: $h, base: $b, body: "Proposed by the scheduled ionos-app-pins helper."}' |
   gh api --method POST "repos/$REPO/pulls" --input - | jq -r .html_url)
