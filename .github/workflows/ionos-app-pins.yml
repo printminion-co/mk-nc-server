@@ -1,0 +1,56 @@
+# Proposes new pins for upstream's separately hosted apps (apps-upstream/) as a pull request
+# into ionos-dev-v33 when a new base release or a changed upstream app list appears.
+# The logic lives in .github/ionos/ionos-app-pins.sh; see .github/ionos/ionos-app-pins.md.
+#
+# NOTE: scheduled workflows run only from the default branch. This file therefore does not
+# run on its own schedule until it is present on the default branch, which a person switches
+# to the dev branch later (separate settings ticket). workflow_dispatch works from any branch
+# that has the file, with the usual limits of the Actions UI.
+name: IONOS app pins
+
+on:
+  schedule:
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Only print what would be created'
+        type: boolean
+        default: false
+      base_release:
+        description: 'Release tag to pin for, for example v33.0.10 (default: newest final release of line 33)'
+        type: string
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: ionos-app-pins
+  cancel-in-progress: false
+
+jobs:
+  pins:
+    name: Propose app pins
+    runs-on: ubuntu-latest
+    steps:
+      # Only the helper script is needed; the repository is never checked out in full.
+      - name: Fetch the helper script
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref_name }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/ionos"
+          gh api -H 'Accept: application/vnd.github.raw+json' \
+            "repos/$REPO/contents/.github/ionos/ionos-app-pins.sh?ref=$REF" \
+            >"$RUNNER_TEMP/ionos/ionos-app-pins.sh"
+
+      - name: Propose pins
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          BASE_RELEASE: ${{ inputs.base_release }}
+        run: bash "$RUNNER_TEMP/ionos/ionos-app-pins.sh"
