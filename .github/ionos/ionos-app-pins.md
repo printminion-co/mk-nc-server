@@ -53,6 +53,10 @@ not publicly readable (GitHub answers 404). The archive ships it (version 5.0.0 
 commit could be looked up. It is the one entry that is separately hosted but not pinned.
 The helper skips any listed app whose repository is not under `nextcloud/`.
 
+A flavor that wants `support` must provide its own public fork of it and add that as a
+submodule with a different name in an app folder of its own (not `apps-upstream/`, which
+the helper owns and prunes), or go without the app.
+
 ## Rule used to pick the pin
 
 1. Take the app list from `stable33.json` in `nextcloud-releases/server` (default branch).
@@ -87,10 +91,49 @@ except for `support`.
 
 ## The helper
 
-`.github/workflows/ionos-app-pins.yml` runs weekly and on demand and calls
-`.github/ionos/ionos-app-pins.sh`. It finds the newest final release tag of line 33, works out
-the pins as above and, when they differ from the pins on `ionos-dev-v33`, opens one pull
-request from `app-pins/<tag>` into `ionos-dev-v33`. The commit contains only the gitlinks
-under `apps-upstream/` and, if the set of apps changed, `.gitmodules`. Nothing happens when
-the pins already match, when the branch exists or when a pull request is open. Test it with
-`bash .github/ionos/ionos-app-pins.test.sh`.
+`.github/workflows/ionos-app-pins.yml` runs weekly (Monday 04:17 UTC) and on demand
+(`workflow_dispatch`, inputs `dry_run` and `base_release`). It checks out only
+`.github/ionos/` (sparse, one commit) and runs `.github/ionos/ionos-app-pins.sh`, which uses
+the API only and clones nothing. It shares `.github/ionos/ionos-lib.sh` with the sync script.
+
+**Which release.** It pins for the base release of the dev branch, never for a newer upstream
+release than the server code. The base is found the way `ionos-sync.sh` does it: the newest final
+`v<line>.x.y` tag of `nextcloud/server` that is an ancestor of the tip of `ionos-dev-v<line>`. Through
+the API: for the final tags of the line, newest first, take the tag's commit (annotated tags are
+dereferenced) and call `compare/<tag commit>...<tip commit>` on the fork; `ahead` or `identical`
+means the tag is an ancestor, and the first such tag is the base. (The tip is passed as its commit
+id, read from the branch first, so no branch name ends up in the compare URL.) The `base_release`
+input overrides this. So the helper proposes pins when the base of the dev branch changes (after a
+candidate was promoted) or when upstream's app list for that release differs from the pins.
+
+**What it does.** It works out the pins as above and, when they differ from the pins on
+`ionos-dev-v33`, creates the branch `app-pins/<tag>` with one commit on top of the dev branch tip and
+opens one pull request into `ionos-dev-v33`. The commit contains only the gitlinks under
+`apps-upstream/`; `.gitmodules` changes only when the set of apps changes (new sections appended,
+removed ones dropped).
+
+**Existing branch or pull request.** An open pull request for the branch is never touched. When the
+branch `app-pins/<tag>` exists and its pins equal the new ones, nothing happens. When it exists with
+other pins (upstream's app list changed in between) it is replaced by a new commit through the API
+with a force update, and a pull request is opened if none is open. The API has no compare-and-swap,
+so the helper re-reads the branch just before moving it and stops when somebody pushed to it
+meanwhile (a best-effort lease).
+
+**Input from upstream is untrusted.** App ids must match `^[a-z0-9_]+$` and repositories
+`^nextcloud/[A-Za-z0-9._-]+$` before they reach an API URL or the `url` of a `.gitmodules` section;
+anything else stops the run. Branch names and refs are passed as query parameters, not concatenated
+into URLs.
+
+**The token.** The helper opens its pull request with the repository secret `IONOS_SYNC_TOKEN`, see
+`ionos-sync.md` for what the token is and how to create it. Pull requests opened with the default
+`GITHUB_TOKEN` do not trigger workflows, so the commit-lint check would not run on them; without the
+secret the workflow falls back to the default token and the log says so. The default token also
+needs the repository setting "Allow GitHub Actions to create and approve pull requests" to open a
+pull request at all; a personal access token does not.
+
+**When it runs.** Scheduled runs and manual runs need the workflow file on the default branch,
+which a person switches to the dev branch later (a separate settings step). Until then nothing runs.
+
+Test it with `bash .github/ionos/ionos-app-pins.test.sh`: the script runs as a process against a
+stub `gh` that behaves like a small stateful GitHub, and the tests check the state it holds
+afterwards.
