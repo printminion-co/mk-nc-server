@@ -1,11 +1,17 @@
 # Proposes new pins for upstream's separately hosted apps (apps-upstream/) as a pull request
-# into ionos-dev-v33 when a new base release or a changed upstream app list appears.
+# into ionos-dev-v33 when its base release changes or upstream's app list for that release differs.
 # The logic lives in .github/ionos/ionos-app-pins.sh; see .github/ionos/ionos-app-pins.md.
 #
 # NOTE: scheduled workflows run only from the default branch. This file therefore does not
 # run on its own schedule until it is present on the default branch, which a person switches
 # to the dev branch later (separate settings ticket). workflow_dispatch works from any branch
 # that has the file, with the usual limits of the Actions UI.
+#
+# SECRET IONOS_SYNC_TOKEN: a pull request opened with the default GITHUB_TOKEN does not trigger
+# workflows, so the commit-lint check would never run on the pins pull request. The helper
+# therefore opens it with a fine-grained personal access token stored as the repository secret
+# IONOS_SYNC_TOKEN (the same secret as ionos-sync.yml). Without the secret it falls back to the
+# default token and says so in the log. See .github/ionos/ionos-app-pins.md.
 name: IONOS app pins
 
 on:
@@ -18,7 +24,7 @@ on:
         type: boolean
         default: false
       base_release:
-        description: 'Release tag to pin for, for example v33.0.10 (default: newest final release of line 33)'
+        description: 'Release tag to pin for, for example v33.0.10 (default: the base release of the dev branch)'
         type: string
         required: false
 
@@ -34,23 +40,22 @@ jobs:
   pins:
     name: Propose app pins
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      # Only the helper script is needed; the repository is never checked out in full.
-      - name: Fetch the helper script
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          REF: ${{ github.ref_name }}
-        run: |
-          mkdir -p "$RUNNER_TEMP/ionos"
-          gh api -H 'Accept: application/vnd.github.raw+json' \
-            "repos/$REPO/contents/.github/ionos/ionos-app-pins.sh?ref=$REF" \
-            >"$RUNNER_TEMP/ionos/ionos-app-pins.sh"
+      # Only the helper scripts are needed; the repository has about 7.6 GB of history, so
+      # check out one commit and one directory. The helper itself works through the API.
+      - name: Check out the helper script
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          fetch-depth: 1
+          sparse-checkout: .github/ionos
+          persist-credentials: false
 
       - name: Propose pins
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.IONOS_SYNC_TOKEN || github.token }}
+          HAS_SYNC_TOKEN: ${{ secrets.IONOS_SYNC_TOKEN != '' }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           DRY_RUN: ${{ inputs.dry_run }}
           BASE_RELEASE: ${{ inputs.base_release }}
-        run: bash "$RUNNER_TEMP/ionos/ionos-app-pins.sh"
+        run: bash .github/ionos/ionos-app-pins.sh

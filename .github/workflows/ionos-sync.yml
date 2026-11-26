@@ -6,6 +6,14 @@
 # NOTE: scheduled workflows only run from the repository's default branch, and a manual
 # run (workflow_dispatch) also needs the file on the default branch. Nothing here runs until
 # the default branch is switched to ionos-dev-v33 (a separate settings step by a person).
+#
+# SECRET IONOS_SYNC_TOKEN: GitHub does not let the default GITHUB_TOKEN create or update files
+# under .github/workflows, and our patch series (and the candidate branches rebased from it)
+# contains workflow files. The candidate push therefore needs a fine-grained personal access
+# token with the workflow scope, stored as the repository secret IONOS_SYNC_TOKEN. Without the
+# secret the run falls back to the default token (dry runs, mirrors and issues still work) and
+# says in the log that the candidate push will be refused. Pushes made with that token do trigger
+# workflows. See .github/ionos/ionos-sync.md.
 
 name: IONOS sync with upstream
 
@@ -27,7 +35,6 @@ permissions:
   contents: write
   issues: write
   actions: write
-  pull-requests: read
 
 concurrency:
   group: ionos-sync
@@ -51,7 +58,8 @@ jobs:
 
       - name: Sync
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.IONOS_SYNC_TOKEN || github.token }}
+          HAS_SYNC_TOKEN: ${{ secrets.IONOS_SYNC_TOKEN != '' }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           DRY_RUN: ${{ inputs.dry_run }}
           UPSTREAM_TAG: ${{ inputs.upstream_tag }}
