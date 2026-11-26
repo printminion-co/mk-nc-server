@@ -75,6 +75,11 @@ if [ "$method" = GET ]; then
     exit 0
   fi
   f="$STUB_DIR/fx/$(fxkey "$key")"
+  if [ -n "${STUB_RACE:-}" ] && [[ $path == repos/$R/git/ref/heads/* ]] && [ -f "$f" ]; then
+    # somebody pushes to the branch between the helper's two reads of it
+    echo x >>"$STUB_DIR/state/reads.$(fxkey "$path")"
+    if [ "$(wc -l <"$STUB_DIR/state/reads.$(fxkey "$path")")" -ge 2 ]; then echo '{"object":{"sha":"beef0000"}}'; exit 0; fi
+  fi
   if [ -f "$f" ]; then cat "$f"; exit 0; fi
   notfound
 fi
@@ -216,7 +221,7 @@ run_script() { # extra env as args; sets OUT and RC
 }
 
 # State the stub holds after a run
-written() { { find "$T/state" -type f ! -name refs ! -name pulls.jsonl ! -name pulls.json ! -name p.tmp; cat "$T/state/refs" "$T/state/pulls.jsonl" 2>/dev/null; } | wc -l; }
+written() { { find "$T/state" -type f ! -name refs ! -name pulls.jsonl ! -name pulls.json ! -name p.tmp ! -name 'reads.*'; cat "$T/state/refs" "$T/state/pulls.jsonl" 2>/dev/null; } | wc -l; }
 branch_sha() { awk -v r="refs/heads/$1" '$1 == r { s = $2 } END { print s }' "$T/state/refs" 2>/dev/null; }
 branch_commit() { cat "$T/state/commits/$(branch_sha "$1")" 2>/dev/null; }
 branch_tree() { cat "$T/state/trees/$(branch_commit "$1" | jq -r .tree)" 2>/dev/null; }
@@ -322,6 +327,16 @@ test_existing_branch_with_stale_pins_is_refreshed() {
   assert_eq "new commit holds the new pin" "$(branch_tree app-pins/v33.0.10 | jq -c '[.tree[]|[.path,.sha]]')" "[[\"apps-upstream/a_one\",\"$NEW1\"]]"
   assert_eq "new commit sits on the dev branch head" "$(branch_commit app-pins/v33.0.10 | jq -c .parents)" "[\"$BASE_SHA\"]"
   assert_eq "a pull request is opened for the refreshed branch (none was open)" "$(pulls | wc -l)" 1
+}
+
+test_branch_moved_meanwhile_is_not_overwritten() {
+  echo "branch pushed to while the helper ran: not overwritten"
+  scenario
+  seed_branch app-pins/v33.0.10 cafe0005 a_one="$OLD1" b_two="$SAME"
+  run_script STUB_RACE=1
+  assert_fails "fails"
+  assert_eq "branch was not moved" "$(branch_sha app-pins/v33.0.10)" ""
+  assert_eq "no pull request" "$(pulls | wc -l)" 0
 }
 
 test_existing_branch_with_open_pull_request_is_left() {
@@ -468,7 +483,7 @@ test_token_warning() {
 for t in test_pins_differ_opens_one_pull_request test_base_is_the_release_of_the_dev_branch \
   test_base_moves_after_promotion test_no_ancestor_tag_fails test_pins_equal_does_nothing \
   test_second_run_is_idempotent test_existing_branch_with_same_pins_does_nothing \
-  test_existing_branch_with_stale_pins_is_refreshed test_existing_branch_with_open_pull_request_is_left \
+  test_existing_branch_with_stale_pins_is_refreshed test_branch_moved_meanwhile_is_not_overwritten test_existing_branch_with_open_pull_request_is_left \
   test_open_pull_request_does_nothing test_dry_run_does_nothing test_base_release_override \
   test_invalid_base_release_is_rejected test_missing_app_tag_fails_without_partial_change \
   test_app_set_change_updates_gitmodules test_untrusted_upstream_data_is_validated \
