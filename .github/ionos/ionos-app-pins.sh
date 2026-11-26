@@ -4,33 +4,33 @@
 #
 # Environment:
 #   GH_TOKEN, GITHUB_REPOSITORY   required (owner/name of this fork)
-#   BASE_BRANCH      branch to propose into, default ionos-dev-v33
+#   BASE_BRANCH      branch to propose into, default ionos-dev-v$LINE
 #   LINE             release line, default 33
 #   BASE_RELEASE     optional tag like v33.0.10; default is the newest final release of LINE
 #   DRY_RUN          "true" to only print what would be created
 set -euo pipefail
 
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+export LOG_PREFIX=ionos-app-pins
+# shellcheck source=ionos-lib.sh
+. "$HERE/ionos-lib.sh"
+
 REPO=${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}
-BASE_BRANCH=${BASE_BRANCH:-ionos-dev-v33}
 LINE=${LINE:-33}
+BASE_BRANCH=${BASE_BRANCH:-$(dev_branch_for_line "$LINE")}
 BASE_RELEASE=${BASE_RELEASE:-}
 DRY_RUN=${DRY_RUN:-false}
 RELEASES_REPO=nextcloud-releases/server
 UPSTREAM_ORG=nextcloud
 
-log() { echo "ionos-app-pins: $*"; }
-die() { echo "ionos-app-pins: error: $*" >&2; exit 1; }
-
 # 1. Which release tag
 if [ -z "$BASE_RELEASE" ]; then
   BASE_RELEASE=$(gh api "repos/$RELEASES_REPO/releases?per_page=100" |
-    jq -r --arg re "^v$LINE\\.[0-9]+\\.[0-9]+\$" \
-      '.[] | select(.prerelease == false and .draft == false and (.tag_name | test($re))) | .tag_name' |
-    sort -V | tail -n 1)
+    jq -r '.[] | select(.prerelease == false and .draft == false) | .tag_name' | newest_final_tag "$LINE")
   [ -n "$BASE_RELEASE" ] || die "no final release of line $LINE found"
 fi
 TAG=$BASE_RELEASE
-[[ $TAG =~ ^v$LINE\.[0-9]+\.[0-9]+$ ]] || die "base release '$TAG' is not a final tag of line $LINE (vN.M.P)"
+[[ $TAG =~ $(final_tag_re "$LINE") ]] || die "base release '$TAG' is not a final tag of line $LINE (vN.M.P)"
 log "release tag $TAG"
 
 # 2. Upstream's app list; apps that live in the fork's apps/ need no pin
