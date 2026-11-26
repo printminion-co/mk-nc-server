@@ -655,7 +655,61 @@ sc_package() {
   check "a bad build number is refused" test "$(status k3)" != 0
 }
 
-ALL="plan retention publish select apps server assemble package"
+# The real recipes of .github/ionos/build-recipes, run against small stand-ins of the app trees with the stubs
+# (npm and composer are the heavy-stub; the recipes take them from $NPM and $COMPOSER like the default recipe).
+recipe_app() { # recipe_app <name> <app id> [tracked files...]: an app folder in a git repo with stale committed built output
+  local d="$ROOT/$1/$2"; rm -rf "$d"; mkdir -p "$d/js" "$d/css" "$d/vendor"
+  git init -q "$d"; echo stale > "$d/js/stale.js"; echo stale > "$d/vendor/stale.php"
+  echo '{"scripts":{"build":"x"}}' > "$d/package.json"; echo '{}' > "$d/composer.json"
+  local f; for f in "${@:3}"; do echo hand > "$d/$f"; done
+  git -C "$d" add -A -f; git -C "$d" commit -q -m app
+}
+run_recipe() { # run_recipe <name> <app id> [VAR=value ...]
+  local d="$ROOT/$1/$2" n="$1" id="$2"; shift 2; : > "$ROOT/$n/cmd.log"
+  ( cd "$d" && env APP="$id" NPM="$ROOT/bin/npm-stub" COMPOSER="$ROOT/bin/composer-stub" CMD_LOG="$ROOT/$n/cmd.log" CMD_BASE="$ROOT/$n" "$@" \
+      bash "$HERE/build-recipes/$id.sh" ) > "$ROOT/$n/out.log" 2>&1
+  echo $? > "$ROOT/$n/status"
+}
+sc_recipes() {
+  local id d
+  for id in calendar groupfolders notes tasks; do
+    check "$id has a recipe" test -f "$HERE/build-recipes/$id.sh"
+  done
+  check "contacts builds with the default recipe (it has no recipe)" test ! -e "$HERE/build-recipes/contacts.sh"
+
+  mkdir -p "$ROOT/rc"
+  for id in calendar groupfolders; do
+    recipe_app rc "$id"; run_recipe rc "$id"; d="$ROOT/rc/$id"
+    check "$id: recipe succeeds" test "$(status rc)" = 0
+    check "$id: committed js/ is replaced by the build" test ! -e "$d/js/stale.js" -a -f "$d/js/built.js"
+    check "$id: npm ci runs with --ignore-scripts" grep -q "$id: npm-stub ci --ignore-scripts" "$ROOT/rc/cmd.log"
+    check "$id: node_modules is deleted afterwards" test ! -e "$d/node_modules"
+  done
+  recipe_app rc calendar; run_recipe rc calendar
+  check "calendar: composer runs without dev packages and without scripts (post-install-cmd runs composer bin)" \
+    grep -q 'calendar: composer-stub install --no-dev .*--no-scripts' "$ROOT/rc/cmd.log"
+  recipe_app rc groupfolders; run_recipe rc groupfolders
+  check "groupfolders: composer is not run (no runtime packages)" test "$(grep -c composer-stub "$ROOT/rc/cmd.log")" = 0
+
+  for id in notes tasks; do
+    recipe_app rc "$id" "css/hand-$id.css"; run_recipe rc "$id"; d="$ROOT/rc/$id"
+    check "$id: recipe succeeds" test "$(status rc)" = 0
+    check "$id: committed js/ is replaced by the build" test ! -e "$d/js/stale.js" -a -f "$d/js/built.js"
+    check "$id: the handwritten css/ file survives" test "$(cat "$d/css/hand-$id.css")" = hand
+    check "$id: npm ci runs with --ignore-scripts" grep -q "$id: npm-stub ci --ignore-scripts" "$ROOT/rc/cmd.log"
+    check "$id: node_modules is deleted afterwards" test ! -e "$d/node_modules"
+  done
+  recipe_app rc tasks css/hand-tasks.css; echo built > "$ROOT/rc/tasks/css/built.css"; echo changed > "$ROOT/rc/tasks/css/hand-tasks.css"
+  run_recipe rc tasks
+  check "tasks: an untracked built css file is removed and a changed tracked one restored" \
+    test ! -e "$ROOT/rc/tasks/css/built.css" -a "$(cat "$ROOT/rc/tasks/css/hand-tasks.css")" = hand
+  for id in calendar groupfolders notes tasks; do
+    recipe_app rc "$id"; run_recipe rc "$id" NPM_NOBUILD="$id"
+    check "$id: a build that produces nothing fails" test "$(status rc)" != 0
+  done
+}
+
+ALL="plan retention publish select apps recipes server assemble package"
 if [ $# -gt 0 ]; then SELECT=("$@"); else read -r -a SELECT <<< "$ALL"; fi
 for s in "${SELECT[@]}"; do
   echo "scenario: $s"
