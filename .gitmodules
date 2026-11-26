@@ -8,3 +8,69 @@
 	path = IONOS
 	url = https://github.com/printminion-co/ncw-flavors.git
 	branch = v33
+[submodule "apps-upstream/activity"]
+	path = apps-upstream/activity
+	url = https://github.com/nextcloud/activity.git
+[submodule "apps-upstream/app_api"]
+	path = apps-upstream/app_api
+	url = https://github.com/nextcloud/app_api.git
+[submodule "apps-upstream/bruteforcesettings"]
+	path = apps-upstream/bruteforcesettings
+	url = https://github.com/nextcloud/bruteforcesettings.git
+[submodule "apps-upstream/circles"]
+	path = apps-upstream/circles
+	url = https://github.com/nextcloud/circles.git
+[submodule "apps-upstream/files_downloadlimit"]
+	path = apps-upstream/files_downloadlimit
+	url = https://github.com/nextcloud/files_downloadlimit.git
+[submodule "apps-upstream/files_pdfviewer"]
+	path = apps-upstream/files_pdfviewer
+	url = https://github.com/nextcloud/files_pdfviewer.git
+[submodule "apps-upstream/firstrunwizard"]
+	path = apps-upstream/firstrunwizard
+	url = https://github.com/nextcloud/firstrunwizard.git
+[submodule "apps-upstream/logreader"]
+	path = apps-upstream/logreader
+	url = https://github.com/nextcloud/logreader.git
+[submodule "apps-upstream/nextcloud_announcements"]
+	path = apps-upstream/nextcloud_announcements
+	url = https://github.com/nextcloud/nextcloud_announcements.git
+[submodule "apps-upstream/notifications"]
+	path = apps-upstream/notifications
+	url = https://github.com/nextcloud/notifications.git
+[submodule "apps-upstream/password_policy"]
+	path = apps-upstream/password_policy
+	url = https://github.com/nextcloud/password_policy.git
+[submodule "apps-upstream/photos"]
+	path = apps-upstream/photos
+	url = https://github.com/nextcloud/photos.git
+[submodule "apps-upstream/privacy"]
+	path = apps-upstream/privacy
+	url = https://github.com/nextcloud/privacy.git
+[submodule "apps-upstream/recommendations"]
+	path = apps-upstream/recommendations
+	url = https://github.com/nextcloud/recommendations.git
+[submodule "apps-upstream/related_resources"]
+	path = apps-upstream/related_resources
+	url = https://github.com/nextcloud/related_resources.git
+[submodule "apps-upstream/serverinfo"]
+	path = apps-upstream/serverinfo
+	url = https://github.com/nextcloud/serverinfo.git
+[submodule "apps-upstream/survey_client"]
+	path = apps-upstream/survey_client
+	url = https://github.com/nextcloud/survey_client.git
+[submodule "apps-upstream/suspicious_login"]
+	path = apps-upstream/suspicious_login
+	url = https://github.com/nextcloud/suspicious_login.git
+[submodule "apps-upstream/text"]
+	path = apps-upstream/text
+	url = https://github.com/nextcloud/text.git
+[submodule "apps-upstream/twofactor_nextcloud_notification"]
+	path = apps-upstream/twofactor_nextcloud_notification
+	url = https://github.com/nextcloud/twofactor_nextcloud_notification.git
+[submodule "apps-upstream/twofactor_totp"]
+	path = apps-upstream/twofactor_totp
+	url = https://github.com/nextcloud/twofactor_totp.git
+[submodule "apps-upstream/viewer"]
+	path = apps-upstream/viewer
+	url = https://github.com/nextcloud/viewer.git
