@@ -115,7 +115,8 @@ pushed. All actions are GitHub's own and pinned to a commit SHA.
 
 - The design says an app recipe override is a `build:` entry in the flavor manifest. The tool does not
   parse it yet, so `.github/ionos/build-recipes/<app>.sh` is the interim place.
-- The example flavor `flavor1` makes `demo` an `always` app of `apps-flavor1/`, a folder this fork does not
-  have; `validate` fails with "app demo is missing" until the folder (or a real app) exists.
+- `flavor1` takes five apps from the app folder `apps-flavor1/` (submodules, see `ionos-flavor-apps.md`); four of them
+  have a recipe in `build-recipes/`. Recipes should use `$NPM` and `$COMPOSER` (set by the tests; unset means the plain commands)
+  instead of plain `npm` and `composer`, so the tests can stub them.
 - No cache (own ticket): server and apps are built on every run.
 - The tool loads the whole tree: about 1.5 GB of memory and 35 s per flavor on the official tree.
