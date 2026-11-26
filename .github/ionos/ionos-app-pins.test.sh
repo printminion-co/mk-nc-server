@@ -22,7 +22,7 @@ AU_TREE=dddddddddddddddddddddddddddddddddddddddd
 
 # --- stub gh ---------------------------------------------------------------
 make_stub() {
-  mkdir -p "$T/bin" "$T/fx" "$T/log"
+  mkdir -p "$T/bin" "$T/fx" "$T/log" "$T/state"
   cat >"$T/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 # Stub gh: only `gh api <endpoint> [--method M] [--input -] [-H h]`.
@@ -40,19 +40,25 @@ while [ $# -gt 0 ]; do
   esac
 done
 n=$(( $(find "$STUB_DIR/log" -name 'call.*' | wc -l) + 1 ))
-echo "$method $endpoint" >"$STUB_DIR/log/call.$n"
-if [ -n "$input" ]; then cat >"$STUB_DIR/log/body.$n"; fi
+echo "$method $endpoint" >"$STUB_DIR/log/call.$n"   # debugging aid only; tests assert on state
+body=""
+if [ -n "$input" ]; then body=$(cat); fi
 key=$(printf '%s' "$endpoint" | tr -c 'A-Za-z0-9._-' '_')
 if [ "$method" = GET ]; then
   if [ -f "$STUB_DIR/fx/$key" ]; then cat "$STUB_DIR/fx/$key"; exit 0; fi
   echo '{"message":"Not Found","status":"404"}'; echo "gh: Not Found (HTTP 404)" >&2; exit 1
 fi
+S="$STUB_DIR/state"
+sha=$(printf '%s' "$body" | sha1sum | cut -c1-40)
 case "$endpoint" in
-  */git/blobs) echo '{"sha":"b10b"}' ;;
-  */git/trees) echo '{"sha":"7ee"}' ;;
-  */git/commits) echo '{"sha":"c0mm17"}' ;;
-  */git/refs) echo '{"ref":"ok"}' ;;
-  */pulls) echo '{"number":7,"html_url":"https://example.invalid/pull/7"}' ;;
+  */git/blobs) mkdir -p "$S/blobs"; printf '%s' "$body" >"$S/blobs/$sha"; echo "{\"sha\":\"$sha\"}" ;;
+  */git/trees) mkdir -p "$S/trees"; printf '%s' "$body" >"$S/trees/$sha"; echo "{\"sha\":\"$sha\"}" ;;
+  */git/commits) mkdir -p "$S/commits"; printf '%s' "$body" >"$S/commits/$sha"; echo "{\"sha\":\"$sha\"}" ;;
+  */git/refs)
+    ref=$(jq -r .ref <<<"$body"); echo "$ref $(jq -r .sha <<<"$body")" >>"$S/refs"
+    printf '{"object":{"sha":"%s"}}' "$(jq -r .sha <<<"$body")" >"$STUB_DIR/fx/$(printf '%s' "repos/ionos/nc/git/ref/${ref#refs/}" | tr -c 'A-Za-z0-9._-' '_')"
+    echo '{"ref":"ok"}' ;;
+  */pulls) jq -c . <<<"$body" >>"$S/pulls.jsonl"; echo '{"number":7,"html_url":"https://example.invalid/pull/7"}' ;;
   *) echo '{}' ;;
 esac
 STUB
@@ -114,13 +120,13 @@ run_script() { # extra env as args; sets OUT and RC
   RC=$?
 }
 
-calls() { cat "$T"/log/call.* 2>/dev/null | sort; }
-posts() { calls | grep -c '^POST ' || true; }
-body_of() { # body_of <suffix>: body of the (single) POST whose endpoint ends with suffix
-  local f
-  f=$(grep -l "^POST .*$1\$" "$T"/log/call.* | head -1)
-  cat "${f/call./body.}"
-}
+# State the stub holds after a run
+written() { { find "$T/state" -type f ! -name refs ! -name pulls.jsonl; cat "$T/state/refs" "$T/state/pulls.jsonl" 2>/dev/null; } | wc -l; }
+branch_sha() { awk -v r="refs/heads/$1" '$1 == r { print $2 }' "$T/state/refs" 2>/dev/null; }
+branch_commit() { cat "$T/state/commits/$(branch_sha "$1")" 2>/dev/null; }
+branch_tree() { cat "$T/state/trees/$(branch_commit "$1" | jq -r .tree)" 2>/dev/null; }
+pulls() { cat "$T/state/pulls.jsonl" 2>/dev/null; }
+blob() { cat "$T/state/blobs/$1" 2>/dev/null; }
 
 ok() { PASSES=$((PASSES + 1)); echo "  ok   $1"; }
 bad() { FAILS=$((FAILS + 1)); echo "  FAIL $1"; [ -z "${2:-}" ] || echo "       $2"; }
@@ -135,18 +141,15 @@ test_pins_differ_opens_one_pull_request() {
   scenario
   run_script
   assert_eq "exit code" "$RC" 0
-  assert_eq "creates exactly one tree" "$(calls | grep -c '^POST .*/git/trees$')" 1
-  assert_eq "creates exactly one commit" "$(calls | grep -c '^POST .*/git/commits$')" 1
-  assert_eq "creates exactly one ref" "$(calls | grep -c '^POST .*/git/refs$')" 1
-  assert_eq "creates exactly one pull request" "$(calls | grep -c '^POST .*/pulls$')" 1
-  assert_eq "no other write call" "$(posts)" 4
-  assert_eq "tree entries" "$(body_of /git/trees | jq -c '[.tree[]|[.path,.mode,.sha]]')" \
+  assert_eq "branch app-pins/v33.0.10 exists" "$([ -n "$(branch_sha app-pins/v33.0.10)" ] && echo yes)" yes
+  assert_eq "exactly one branch was created" "$(wc -l <"$T/state/refs")" 1
+  assert_eq "exactly one pull request" "$(pulls | wc -l)" 1
+  assert_eq "commit tree entries" "$(branch_tree app-pins/v33.0.10 | jq -c '[.tree[]|[.path,.mode,.sha]]')" \
     "[[\"apps-upstream/a_one\",\"160000\",\"$NEW1\"]]"
-  assert_eq "tree is based on the base commit's tree" "$(body_of /git/trees | jq -r .base_tree)" "$ROOT_TREE"
-  assert_eq "commit parent is the base branch head" "$(body_of /git/commits | jq -c .parents)" "[\"$BASE_SHA\"]"
-  assert_eq "commit message" "$(body_of /git/commits | jq -r .message)" "IONOS(apps): pin upstream's bundled apps for v33.0.10"
-  assert_eq "branch name" "$(body_of /git/refs | jq -r .ref)" "refs/heads/app-pins/v33.0.10"
-  assert_eq "pull request head and base" "$(body_of /pulls | jq -c '[.head,.base]')" '["app-pins/v33.0.10","ionos-dev-v33"]'
+  assert_eq "tree is based on the base commit's tree" "$(branch_tree app-pins/v33.0.10 | jq -r .base_tree)" "$ROOT_TREE"
+  assert_eq "commit parent is the base branch head" "$(branch_commit app-pins/v33.0.10 | jq -c .parents)" "[\"$BASE_SHA\"]"
+  assert_eq "commit message" "$(branch_commit app-pins/v33.0.10 | jq -r .message)" "IONOS(apps): pin upstream's bundled apps for v33.0.10"
+  assert_eq "pull request head and base" "$(pulls | jq -c '[.head,.base]')" '["app-pins/v33.0.10","ionos-dev-v33"]'
 }
 
 test_pins_equal_does_nothing() {
@@ -155,7 +158,7 @@ test_pins_equal_does_nothing() {
   tag_ref v33.0.10 a_one "$OLD1"
   run_script
   assert_eq "exit code" "$RC" 0
-  assert_eq "no write call" "$(posts)" 0
+  assert_eq "nothing was created" "$(written)" 0
   assert_contains "says up to date" "$OUT" "already match"
 }
 
@@ -165,7 +168,7 @@ test_existing_branch_does_nothing() {
   fx 'repos/ionos/nc/git/ref/heads/app-pins/v33.0.10' '{"object":{"sha":"e"}}'
   run_script
   assert_eq "exit code" "$RC" 0
-  assert_eq "no write call" "$(posts)" 0
+  assert_eq "nothing was created" "$(written)" 0
   assert_contains "mentions the branch" "$OUT" "app-pins/v33.0.10 already exists"
 }
 
@@ -175,7 +178,7 @@ test_open_pull_request_does_nothing() {
   fx 'repos/ionos/nc/pulls?state=open&head=ionos:app-pins/v33.0.10&base=ionos-dev-v33' '[{"number":5}]'
   run_script
   assert_eq "exit code" "$RC" 0
-  assert_eq "no write call" "$(posts)" 0
+  assert_eq "nothing was created" "$(written)" 0
   assert_contains "mentions the pull request" "$OUT" "pull request #5"
 }
 
@@ -184,7 +187,7 @@ test_dry_run_does_nothing() {
   scenario
   run_script DRY_RUN=true
   assert_eq "exit code" "$RC" 0
-  assert_eq "no write call" "$(posts)" 0
+  assert_eq "nothing was created" "$(written)" 0
   assert_contains "reports the planned change" "$OUT" "apps-upstream/a_one"
 }
 
@@ -196,9 +199,8 @@ test_base_release_override() {
   fx 'repos/ionos/nc/pulls?state=open&head=ionos:app-pins/v33.0.9&base=ionos-dev-v33' '[]'
   run_script BASE_RELEASE=v33.0.9
   assert_eq "exit code" "$RC" 0
-  assert_eq "tree entries" "$(body_of /git/trees | jq -c '[.tree[]|[.path,.sha]]')" \
+  assert_eq "tree entries" "$(branch_tree app-pins/v33.0.9 | jq -c '[.tree[]|[.path,.sha]]')" \
     "[[\"apps-upstream/b_two\",\"$NEW1\"]]"
-  assert_eq "branch name" "$(body_of /git/refs | jq -r .ref)" "refs/heads/app-pins/v33.0.9"
 }
 
 test_invalid_base_release_is_rejected() {
@@ -209,7 +211,7 @@ test_invalid_base_release_is_rejected() {
   fx 'repos/ionos/nc/pulls?state=open&head=ionos:app-pins/v34.0.1&base=ionos-dev-v33' '[]'
   run_script 'BASE_RELEASE=v34.0.1'
   assert_eq "fails" "$([ "$RC" -ne 0 ] && echo yes || echo no)" yes
-  assert_eq "no write call" "$(posts)" 0
+  assert_eq "nothing was created" "$(written)" 0
 }
 
 test_missing_app_tag_fails_without_partial_change() {
@@ -218,7 +220,7 @@ test_missing_app_tag_fails_without_partial_change() {
   rm "$T/fx/repos_nextcloud_b_two_git_ref_tags_v33.0.10"
   run_script
   assert_eq "fails" "$([ "$RC" -ne 0 ] && echo yes || echo no)" yes
-  assert_eq "no write call" "$(posts)" 0
+  assert_eq "nothing was created" "$(written)" 0
 }
 
 test_app_set_change_updates_gitmodules() {
@@ -230,10 +232,11 @@ test_app_set_change_updates_gitmodules() {
   tag_ref v33.0.10 a_one "$OLD1"
   run_script
   assert_eq "exit code" "$RC" 0
-  assert_eq "tree entries" "$(body_of /git/trees | jq -c '[.tree[]|[.path,.mode,.sha]]|sort')" \
-    "[[\".gitmodules\",\"100644\",\"b10b\"],[\"apps-upstream/b_two\",\"160000\",null],[\"apps-upstream/e_new\",\"160000\",\"$NEW_E\"]]"
-  local gm
-  gm=$(body_of /git/blobs | jq -r .content)
+  local gmsha gm
+  gmsha=$(branch_tree app-pins/v33.0.10 | jq -r '.tree[]|select(.path==".gitmodules").sha')
+  assert_eq "tree entries" "$(branch_tree app-pins/v33.0.10 | jq -c '[.tree[]|[.path,.mode,(if .path==".gitmodules" then "blob" else .sha end)]]|sort')" \
+    "[[\".gitmodules\",\"100644\",\"blob\"],[\"apps-upstream/b_two\",\"160000\",null],[\"apps-upstream/e_new\",\"160000\",\"$NEW_E\"]]"
+  gm=$(blob "$gmsha" | jq -r .content)
   assert_contains ".gitmodules gets the new app" "$gm" '[submodule "apps-upstream/e_new"]'
   assert_contains ".gitmodules keeps the new app url" "$gm" 'url = https://github.com/nextcloud/e_new.git'
   assert_contains ".gitmodules keeps the 3rdparty entry" "$gm" '[submodule "3rdparty"]'

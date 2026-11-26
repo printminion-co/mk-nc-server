@@ -78,7 +78,8 @@ JSON
   : > "$w/state/calls.log"
   cat > "$w/bin/gh" <<'STUB'
 #!/usr/bin/env bash
-# Stub gh: records every call and answers only the API calls ionos-sync.sh uses.
+# Stub gh: a tiny stateful GitHub. State lives in $STUB_STATE (issues.json, workflows.json) and in
+# the local bare repositories $STUB_UP and $STUB_FORK. calls.log is only a debugging aid.
 S="$STUB_STATE"
 echo "gh $*" >> "$S/calls.log"
 [ "${1:-}" = api ] || { echo "stub gh: unsupported: $*" >&2; exit 2; }
@@ -86,28 +87,45 @@ shift
 method=GET; endpoint=""; declare -A F
 while [ $# -gt 0 ]; do
   case "$1" in
-    -X) method="$2"; shift 2 ;;
-    -f|-F) F["${2%%=*}"]="${2#*=}"; shift 2 ;;
-    --paginate|--silent) shift ;;
-    --jq|-q) shift 2 ;;
+    -X|--method) method="$2"; shift 2 ;;
+    -f|-F|--field|--raw-field) F["${2%%=*}"]="${2#*=}"; shift 2 ;;
+    --jq|-q|-H|--header) shift 2 ;;
     -*) shift ;;
     *) endpoint="$1"; shift ;;
   esac
 done
-case "$method $endpoint" in
+path="${endpoint%%\?*}"
+if [[ "$endpoint" == *\?* ]]; then
+  q="${endpoint#*\?}"
+  [[ "$q" =~ (^|&)state=([a-z]+) ]] && F[state]="${BASH_REMATCH[2]}"
+fi
+http() { echo "{\"message\":\"$2\"}"; echo "gh: $2 (HTTP $1)" >&2; exit 1; }
+case "$method $path" in
   "POST repos/"*/merge-upstream)
-    b="${F[branch]}"; v="STUB_MERGE_${b//[^A-Za-z0-9]/_}"
-    if [ "${!v:-}" = 409 ]; then echo '{"message":"There are merge conflicts"}'; echo "gh: HTTP 409" >&2; exit 1; fi
-    echo '{"message":"Successfully fetched and fast-forwarded from upstream.","merge_type":"fast-forward"}' ;;
-  "GET repos/"*/actions/workflows*) cat "$S/workflows.json" ;;
+    b="${F[branch]}"
+    git -C "$STUB_FORK" fetch -q "$STUB_UP" "+refs/heads/$b:refs/stub-up/$b" 2>/dev/null || http 404 "Not Found"
+    if git -C "$STUB_FORK" merge-base --is-ancestor "refs/heads/$b" "refs/stub-up/$b"; then
+      git -C "$STUB_FORK" update-ref "refs/heads/$b" "refs/stub-up/$b"
+      git -C "$STUB_FORK" update-ref -d "refs/stub-up/$b"
+      echo '{"message":"Successfully fetched and fast-forwarded from upstream.","merge_type":"fast-forward"}'
+    else
+      git -C "$STUB_FORK" update-ref -d "refs/stub-up/$b"
+      http 409 "There are merge conflicts"
+    fi ;;
+  "GET repos/"*/actions/workflows)
+    [ "${STUB_FAIL:-}" = workflows ] && http 500 "Server Error"
+    cat "$S/workflows.json" ;;
   "PUT repos/"*/actions/workflows/*/disable)
-    id="${endpoint#*/workflows/}"; id="${id%/disable}"
-    jq --argjson id "$id" '(.workflows[]|select(.id==$id)).state="disabled_manually"' "$S/workflows.json" > "$S/w.tmp" && mv "$S/w.tmp" "$S/workflows.json" ;;
-  "GET repos/"*/issues*) jq -c '.[]' "$S/issues.json" | jq -s '.' ;;
+    id="${path#*/workflows/}"; id="${id%/disable}"
+    [ "$(jq --argjson id "$id" '.workflows[]|select(.id==$id).deny // false' "$S/workflows.json")" = true ] && http 403 "Resource not accessible by integration"
+    jq --argjson id "$id" '(.workflows[]|select(.id==$id)) |= (if .state != "active" then .redundant = true else . end | .state = "disabled_manually")' \
+      "$S/workflows.json" > "$S/w.tmp" && mv "$S/w.tmp" "$S/workflows.json" ;;
+  "GET repos/"*/issues)
+    jq -c --arg st "${F[state]:-open}" '[.[] | select($st == "all" or .state == $st)]' "$S/issues.json" ;;
   "POST repos/"*/issues)
     jq --arg t "${F[title]}" --arg b "${F[body]}" '. + [{"number":(length+1),"title":$t,"body":$b,"state":"open"}]' "$S/issues.json" > "$S/i.tmp" && mv "$S/i.tmp" "$S/issues.json"
     echo '{"number":1}' ;;
-  *) echo "stub gh: unexpected $method $endpoint" >&2; exit 2 ;;
+  *) echo "stub gh: unexpected $method $path" >&2; exit 2 ;;
 esac
 STUB
   chmod +x "$w/bin/gh"
@@ -116,7 +134,8 @@ STUB
 # run_sync <world> [VAR=value ...]  -> runs the script, output in $W/out.log, status in $W/status
 run_sync() {
   local w="$ROOT/$1"; shift
-  env PATH="$w/bin:$PATH" STUB_STATE="$w/state" GITHUB_REPOSITORY=acme/server \
+  env PATH="$w/bin:$PATH" STUB_STATE="$w/state" STUB_UP="$w/upstream.git" STUB_FORK="$w/fork.git" \
+    GITHUB_REPOSITORY=acme/server \
     UPSTREAM_URL="$w/upstream.git" FORK_URL="$w/fork.git" "$@" \
     bash "$SYNC" > "$w/out.log" 2>&1
   echo $? > "$w/status"
@@ -124,7 +143,8 @@ run_sync() {
 
 fork_ref() { git -C "$ROOT/$1/fork.git" rev-parse --verify -q "$2"; }
 up_tag()   { git -C "$ROOT/$1/upstream.git" rev-parse --verify -q "$2^{commit}"; }
-calls()    { grep -c "$2" "$ROOT/$1/state/calls.log"; }
+# everything the stubbed GitHub holds: fork branches and tags, issues, workflows
+snapshot() { { git -C "$ROOT/$1/fork.git" for-each-ref refs/heads refs/tags; cat "$ROOT/$1/state/issues.json" "$ROOT/$1/state/workflows.json"; } | sha256sum; }
 n_issues() { jq length "$ROOT/$1/state/issues.json"; }
 state_of() { jq -r --argjson id "$2" '.workflows[]|select(.id==$id).state' "$ROOT/$1/state/workflows.json"; }
 
@@ -155,7 +175,7 @@ sc_conflict() {
   check "exit status 0" test "$(cat "$ROOT/conflict/status")" = 0
   check "no candidate branch" test -z "$(fork_ref conflict $CAND)"
   check "ionos-dev-v33 is not moved" test "$(fork_ref conflict refs/heads/ionos-dev-v33)" = "$dev0"
-  check "exactly one issue created" test "$(calls conflict 'POST repos/acme/server/issues')" = 1
+  check "exactly one issue exists" test "$(n_issues conflict)" = 1
   check "issue title names the tag" test "$(jq -r '.[0].title' "$ROOT/conflict/state/issues.json")" = "Rebase of ionos-dev-v33 onto v33.0.10 conflicts"
   check "issue body names the conflicting file" grep -q 'a.txt' <(jq -r '.[0].body' "$ROOT/conflict/state/issues.json")
   check "issue body explains the manual rebase" grep -q 'git rebase --onto v33.0.10 v33.0.9' <(jq -r '.[0].body' "$ROOT/conflict/state/issues.json")
@@ -164,15 +184,12 @@ sc_conflict() {
 sc_idempotent_clean() {
   world idem clean final
   run_sync idem
-  local c1; c1="$(fork_ref idem $CAND)"
-  : > "$ROOT/idem/state/calls.log"
+  local c1 s1; c1="$(fork_ref idem $CAND)"; s1="$(snapshot idem)"
   run_sync idem
   check "second run exits 0" test "$(cat "$ROOT/idem/status")" = 0
   check "candidate branch unchanged" test "$(fork_ref idem $CAND)" = "$c1"
   check "second run says the candidate exists" grep -q 'already exists' "$ROOT/idem/out.log"
-  # merge-upstream is a POST but a no-op when the mirror is current, so it is not counted
-  check "second run makes no mutating gh call (besides the no-op mirror sync)" \
-    test "$(grep -v merge-upstream "$ROOT/idem/state/calls.log" | grep -cE 'PUT|POST|DELETE|PATCH')" = 0
+  check "second run changes nothing (branches, tags, issues, workflows)" test "$(snapshot idem)" = "$s1"
 }
 
 sc_idempotent_conflict() {
@@ -189,26 +206,26 @@ sc_disable_workflows() {
   run_sync dis
   check "non-ionos active workflows are disabled" test "$(state_of dis 1)$(state_of dis 3)" = disabled_manuallydisabled_manually
   check "ionos- workflow stays active" test "$(state_of dis 2)" = active
-  check "already disabled workflow is not touched" test "$(calls dis 'PUT repos/acme/server/actions/workflows/4/')" = 0
-  check "exactly two disable calls" test "$(calls dis 'PUT .*/disable')" = 2
-  : > "$ROOT/dis/state/calls.log"
+  check "already disabled workflow stays as it was" test "$(state_of dis 4)" = disabled_manually
+  check "no workflow was disabled twice" test "$(jq '[.workflows[]|select(.redundant)]|length' "$ROOT/dis/state/workflows.json")" = 0
+  local s1; s1="$(snapshot dis)"
   run_sync dis
-  check "second run makes no disable call" test "$(calls dis 'PUT')" = 0
+  check "second run changes nothing" test "$(snapshot dis)" = "$s1"
 }
 
 sc_dry_run() {
   world dry clean final
-  local dev0; dev0="$(fork_ref dry refs/heads/ionos-dev-v33)"
+  local s0; s0="$(snapshot dry)"
   run_sync dry DRY_RUN=true
   check "exit status 0" test "$(cat "$ROOT/dry/status")" = 0
   check "no candidate branch" test -z "$(fork_ref dry $CAND)"
-  check "no mutating gh call" test "$(grep -cE 'PUT|POST|DELETE|PATCH' "$ROOT/dry/state/calls.log")" = 0
-  check "workflows unchanged" test "$(state_of dry 1)" = active
+  check "nothing changed (branches, issues, workflows, mirrors)" test "$(snapshot dry)" = "$s0"
   check "reports what it would do" grep -q 'would: push candidate/ionos-dev-v33/v33.0.10' "$ROOT/dry/out.log"
-  check "ionos-dev-v33 is not moved" test "$(fork_ref dry refs/heads/ionos-dev-v33)" = "$dev0"
   world dryc conflict final
+  s0="$(snapshot dryc)"
   run_sync dryc DRY_RUN=true
   check "dry run on conflict opens no issue" test "$(n_issues dryc)" = 0
+  check "dry run on conflict changes nothing" test "$(snapshot dryc)" = "$s0"
 }
 
 sc_prerelease_ignored() {
@@ -234,16 +251,20 @@ sc_tag_override() {
 sc_mirrors() {
   world mir clean final
   run_sync mir
-  check "merge-upstream called for master" test "$(calls mir 'POST repos/acme/server/merge-upstream -f branch=master')" = 1
-  check "merge-upstream called for stable33" test "$(calls mir 'POST repos/acme/server/merge-upstream -f branch=stable33')" = 1
-  check "mirrors are never pushed to directly" test "$(calls mir 'force')" = 0
+  check "stable33 mirror is fast-forwarded to upstream" test "$(fork_ref mir refs/heads/stable33)" = "$(git -C "$ROOT/mir/upstream.git" rev-parse refs/heads/stable33)"
+  check "master mirror stays at upstream's master" test "$(fork_ref mir refs/heads/master)" = "$(git -C "$ROOT/mir/upstream.git" rev-parse refs/heads/master)"
   world mir409 clean final
-  run_sync mir409 STUB_MERGE_stable33=409
-  check "a 409 fails the run" test "$(cat "$ROOT/mir409/status")" != 0
-  check "the 409 is reported" grep -q 'stable33' <(grep -i 'error' "$ROOT/mir409/out.log")
-  check "it is not forced (merge-upstream tried once, no retry or push to the mirror)" \
-    test "$(calls mir409 'branch=stable33')" = 1 -a "$(fork_ref mir409 refs/heads/stable33)" = "$(up_tag mir409 v33.0.9)"
-  check "other steps still run after a 409" test -n "$(fork_ref mir409 $CAND)"
+  # diverge the fork's stable33 from upstream's
+  git -C "$ROOT/mir409/fk-work" checkout -q -q -b diverged "$(up_tag mir409 v33.0.9)"
+  git -C "$ROOT/mir409/fk-work" commit -q --allow-empty -m "diverged"
+  git -C "$ROOT/mir409/fk-work" push -q -f "$ROOT/mir409/fork.git" diverged:refs/heads/stable33
+  local div; div="$(fork_ref mir409 refs/heads/stable33)"
+  run_sync mir409
+  check "a diverged mirror fails the run" test "$(cat "$ROOT/mir409/status")" != 0
+  check "the failure is reported as an error naming the mirror" grep -q '::error::.*stable33' "$ROOT/mir409/out.log"
+  check "the diverged mirror is not forced" test "$(fork_ref mir409 refs/heads/stable33)" = "$div"
+  check "other steps still run (candidate exists)" test -n "$(fork_ref mir409 $CAND)"
+  check "other steps still run (workflows disabled)" test "$(state_of mir409 1)" = disabled_manually
 }
 
 ALL="clean conflict idempotent_clean idempotent_conflict disable_workflows dry_run prerelease_ignored tag_override mirrors"
