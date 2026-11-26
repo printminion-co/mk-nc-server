@@ -1,0 +1,42 @@
+# Commits in this fork follow IONOS(<scope>): <subject>. This workflow fails a pull request
+# when any of its commits does not. Only commit metadata is read; no code of the pull
+# request is checked out or run.
+name: IONOS commit lint
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ionos-commit-lint-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  commit-lint:
+    name: Commit messages follow IONOS(scope) subject
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the commit messages of the pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PULL_REQUEST: ${{ github.event.pull_request.number }}
+        run: |
+          pattern='^IONOS\([a-z0-9][a-z0-9-]*\): [^[:space:]].*$'
+          failed=0
+          while IFS=$'\t' read -r sha subject; do
+            if ! [[ "$subject" =~ $pattern ]]; then
+              echo "::error title=Commit message::${sha:0:7} \"${subject}\" does not match IONOS(<scope>): <subject>"
+              failed=1
+            fi
+          done < <(gh api --paginate "repos/${REPO}/pulls/${PULL_REQUEST}/commits" \
+            --jq '.[] | [.sha, (.commit.message | split("\n")[0])] | @tsv')
+          if [ "$failed" -ne 0 ]; then
+            echo "Use IONOS(<scope>): <subject>, for example: IONOS(ci): optimize build workflow"
+            exit 1
+          fi
+          echo "All commit messages follow IONOS(<scope>): <subject>."
