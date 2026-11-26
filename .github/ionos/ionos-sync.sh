@@ -12,6 +12,10 @@
 #   MIRRORS            branches fast-forwarded from upstream, default "master stable$LINE"
 #   UPSTREAM_TAG       optional: use this tag instead of the newest final tag of the line
 #   DRY_RUN            "true": print what would be done, change nothing
+#   HAS_SYNC_TOKEN     "true" when GH_TOKEN is the repository secret IONOS_SYNC_TOKEN (a token with the
+#                      workflow scope); anything else means the default GITHUB_TOKEN, which cannot push
+#                      workflow files (see ionos-sync.md)
+# shellcheck disable=SC2317  # steps run through run_step "$@", which shellcheck cannot follow
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,24 +31,59 @@ UPSTREAM_URL="${UPSTREAM_URL:-https://github.com/nextcloud/server.git}"
 FORK_URL="${FORK_URL:-https://github.com/${REPO}.git}"
 UPSTREAM_TAG="${UPSTREAM_TAG:-}"
 DRY_RUN="${DRY_RUN:-false}"
+HAS_SYNC_TOKEN="${HAS_SYNC_TOKEN:-false}"
 CANDIDATE_PREFIX="candidate/${DEV_BRANCH}"
 TAG_RE="$(final_tag_re "$LINE")"
 
 FAILED=0
 is_dry_run() { [ "$DRY_RUN" = true ]; }
 would()      { log "[dry run] would: $*"; }
-fail()       { echo "::error::$*"; FAILED=1; }
+
+# Each step runs isolated in a subshell: a failure is reported and the other steps still run.
+run_step() {
+  local name="$1" rc
+  shift
+  set +e
+  ( set -e; "$@" )
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then echo "::error::ionos-sync: step '${name}' failed (exit ${rc})"; FAILED=1; fi
+}
+
+# The credential git sends for pushes, in the form the extraheader carries it.
+token_header_b64() { printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0; }
+
+# Must run before the value is used anywhere: the log would otherwise show it in clear.
+mask_token_header() {
+  [ -n "${GH_TOKEN:-}" ] && echo "::add-mask::$(token_header_b64)"
+  return 0
+}
+
+warn_without_sync_token() {
+  [ "$HAS_SYNC_TOKEN" = true ] && return 0
+  warn "IONOS_SYNC_TOKEN is not set, using the default GITHUB_TOKEN. GitHub refuses a push that creates or updates files under .github/workflows with that token, and our patch series contains workflow files: pushing a candidate branch will be refused. Store a token with the workflow scope as the repository secret IONOS_SYNC_TOKEN (see ionos-sync.md)."
+}
+
+# A code fence longer than any run of backticks in the paths, so that no path can close it.
+fence_for() {
+  local longest n
+  longest="$(grep -o '`*' <<<"$1" | awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }')"
+  n=$(( longest >= 3 ? longest + 1 : 3 ))
+  printf '`%.0s' $(seq "$n")
+}
 
 open_conflict_issue() {
-  local tag="$1" base="$2" files="$3" title body
+  local tag="$1" base="$2" files="$3" title body fence
   title="Rebase of ${DEV_BRANCH} onto ${tag} conflicts"
-  # shellcheck disable=SC2016  # the backticks in the sed script are literal markdown
+  fence="$(fence_for "$files")"
   body="$(cat <<BODY
 Upstream released \`${tag}\`. Rebasing the patch series of \`${DEV_BRANCH}\` (the commits after \`${base}\`) onto it conflicts, so no candidate branch \`${CANDIDATE_PREFIX}/${tag}\` was created.
 
 Conflicting files:
 
-$(echo "$files" | sed 's/^/- `/; s/$/`/')
+${fence}
+${files}
+${fence}
 
 Rebase by hand:
 
@@ -80,8 +119,7 @@ candidate_setup() {
   git -C "$work" remote add upstream "$UPSTREAM_URL"
   git -C "$work" remote add fork "$FORK_URL"
   if [ -n "${GH_TOKEN:-}" ] && [[ "$FORK_URL" == https://github.com/* ]]; then
-    git -C "$work" config "http.https://github.com/.extraheader" \
-      "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+    git -C "$work" config "http.https://github.com/.extraheader" "AUTHORIZATION: basic $(token_header_b64)"
   fi
   git -C "$work" config commit.gpgsign false   # candidate commits stay unsigned; the promoter re-signs
   git -C "$work" fetch -q --filter=blob:none upstream "+refs/tags/v${LINE}.*:refs/tags/v${LINE}.*"
@@ -101,8 +139,8 @@ find_base() {
 choose_tag() {
   local work="$1"
   if [ -n "$UPSTREAM_TAG" ]; then
-    [[ "$UPSTREAM_TAG" =~ $TAG_RE ]] || { fail "upstream_tag ${UPSTREAM_TAG} is not a final v${LINE}.x.y tag"; return 1; }
-    git -C "$work" rev-parse -q --verify "refs/tags/$UPSTREAM_TAG" >/dev/null || { fail "tag ${UPSTREAM_TAG} not found upstream"; return 1; }
+    [[ "$UPSTREAM_TAG" =~ $TAG_RE ]] || die "upstream_tag ${UPSTREAM_TAG} is not a final v${LINE}.x.y tag"
+    git -C "$work" rev-parse -q --verify "refs/tags/$UPSTREAM_TAG" >/dev/null || die "tag ${UPSTREAM_TAG} not found upstream"
     echo "$UPSTREAM_TAG"
   else
     git -C "$work" tag --list "v${LINE}.*" | newest_final_tag "$LINE"
@@ -111,13 +149,14 @@ choose_tag() {
 
 # already_handled <work> <cand> <tag>: true when a candidate branch or an issue for the tag exists.
 already_handled() {
-  local work="$1" cand="$2" tag="$3"
+  local work="$1" cand="$2" tag="$3" titles
   if [ -n "$(git -C "$work" ls-remote --heads fork "refs/heads/${cand}")" ]; then
     log "candidate: ${cand} already exists; nothing to do"; return 0
   fi
-  if gh_paginate '.[] | select(.pull_request == null) | .title' "repos/${REPO}/issues?state=open&per_page=100" \
-       | grep -qxF "Rebase of ${DEV_BRANCH} onto ${tag} conflicts"; then
-    log "candidate: an open issue for ${tag} already exists; nothing to do"; return 0
+  # all states: a closed issue also counts (see ionos-sync.md)
+  titles="$(gh_paginate '.[] | select(.pull_request == null) | .title' -X GET "repos/${REPO}/issues" -f state=all -f per_page=100)"
+  if grep -qxF "Rebase of ${DEV_BRANCH} onto ${tag} conflicts" <<<"$titles"; then
+    log "candidate: an issue for ${tag} already exists (any state); nothing to do"; return 0
   fi
   return 1
 }
@@ -131,7 +170,7 @@ rebase_series() {
        rebase -q --onto "refs/tags/${tag}" "refs/tags/${base}" >/dev/null 2>&1; then
     return 0
   fi
-  CONFLICT_FILES="$(git -C "$work" diff --name-only --diff-filter=U)"
+  CONFLICT_FILES="$(git -C "$work" diff --name-only -z --diff-filter=U | tr '\0' '\n')"
   git -C "$work" rebase --abort >/dev/null 2>&1 || true
   return 1
 }
@@ -141,7 +180,10 @@ publish_candidate() {
   if is_dry_run; then
     would "push ${cand}"
   else
-    git -C "$work" push -q fork "HEAD:refs/heads/${cand}"
+    if ! git -C "$work" push -q fork "HEAD:refs/heads/${cand}"; then
+      [ "$HAS_SYNC_TOKEN" = true ] || warn "the push was probably refused because the default token cannot push workflow files; set the secret IONOS_SYNC_TOKEN"
+      die "candidate: pushing ${cand} failed"
+    fi
     log "candidate: pushed ${cand}"
   fi
 }
@@ -153,8 +195,9 @@ make_candidate() {
   candidate_setup "$work"
   tip="refs/remotes/fork/${DEV_BRANCH}"
 
-  base="$(find_base "$work" "$tip")" || { fail "no release tag of line ${LINE} is an ancestor of ${DEV_BRANCH}"; return; }
-  tag="$(choose_tag "$work")" || return
+  base="$(find_base "$work" "$tip")" || die "no release tag of line ${LINE} is an ancestor of ${DEV_BRANCH}"
+  tag="$(choose_tag "$work")"
+  [ -n "$tag" ] || die "no final release tag of line ${LINE} found upstream"
   if [ "$(printf '%s\n%s\n' "$base" "$tag" | sort -V | tail -n1)" = "$base" ]; then
     log "candidate: ${tag} is not newer than base ${base}; nothing to do"; return
   fi
@@ -174,36 +217,48 @@ make_candidate() {
 # rebase); instead every active workflow outside our ionos- prefix is disabled. Workflows that
 # upstream adds later are caught by the next run.
 disable_upstream_workflows() {
-  local id path
+  local id path list err failed=0
+  # only real workflow files: dynamic workflows (for example pages-build-deployment) have a
+  # path outside .github/workflows/ and cannot be disabled this way
+  list="$(gh_paginate '.workflows[] | select(.state == "active")
+             | select(.path | startswith(".github/workflows/"))
+             | select(.path | startswith(".github/workflows/ionos-") | not) | [.id, .path] | @tsv' \
+             "repos/${REPO}/actions/workflows?per_page=100")"
   while IFS=$'\t' read -r id path; do
+    [ -n "$id" ] || continue
     if is_dry_run; then
       would "disable workflow ${path} (${id})"
-    else
-      gh api -X PUT "repos/${REPO}/actions/workflows/${id}/disable" >/dev/null
+    elif err="$(gh api -X PUT "repos/${REPO}/actions/workflows/${id}/disable" 2>&1 >/dev/null)"; then
       log "workflows: disabled ${path}"
+    elif [[ "$err" == *"HTTP 4"* ]]; then
+      warn "workflow ${path} (${id}) could not be disabled, continuing: ${err}"
+    else
+      echo "::error::ionos-sync: disabling workflow ${path} (${id}) failed: ${err}"; failed=1
     fi
-  done < <(gh_paginate '.workflows[] | select(.state == "active")
-             | select(.path | startswith(".github/workflows/ionos-") | not) | [.id, .path] | @tsv' \
-             "repos/${REPO}/actions/workflows?per_page=100")
+  done <<<"$list"
+  return "$failed"
 }
 
 # Mirrors move only by fast-forward: GitHub's merge-upstream endpoint refuses (HTTP 409) when the
 # branch has diverged. That is never forced; the run fails so that a person looks at it.
 sync_mirrors() {
-  local b out
+  local b out failed=0
   for b in $MIRRORS; do
     if is_dry_run; then
       would "sync mirror ${b} (fast-forward only)"
     elif out="$(gh api -X POST "repos/${REPO}/merge-upstream" -f branch="$b" 2>&1)"; then
       log "mirror ${b}: $(echo "$out" | jq -r '.merge_type // .message' 2>/dev/null || echo "$out")"
     else
-      fail "mirror ${b} could not be fast-forwarded from upstream (diverged?); not forced. ${out}"
+      echo "::error::ionos-sync: mirror ${b} could not be fast-forwarded from upstream (diverged?); not forced. ${out}"; failed=1
     fi
   done
+  return "$failed"
 }
 
+mask_token_header
 is_dry_run && log "dry run: nothing will be changed"
-sync_mirrors
-disable_upstream_workflows
-make_candidate
+warn_without_sync_token
+run_step mirrors sync_mirrors
+run_step workflows disable_upstream_workflows
+run_step candidate make_candidate
 exit "$FAILED"

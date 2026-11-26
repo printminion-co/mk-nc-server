@@ -33,7 +33,8 @@ git config --global protocol.file.allow always
 #           that changes a.txt.
 # fork:     ionos-dev-v33 = v33.0.9 + 2 commits; the second touches a.txt (conflict) or b.txt (clean).
 world() {
-  local kind="$2" tagkind="$3" w="$ROOT/$1"
+  local kind="$2" tagkind="$3" w="$ROOT/$1" afile=a.txt
+  [ "$kind" = conflict-fence ] && { afile='```'; kind=conflict; }   # a path that looks like a closing code fence
   mkdir -p "$w/bin" "$w/state"
   git init -q --bare "$w/upstream.git"
   git -C "$w/upstream.git" config uploadpack.allowFilter true
@@ -42,10 +43,10 @@ world() {
   (
     cd "$w/up-work" || exit 1
     git checkout -q -b stable33
-    printf 'a1\na2\na3\n' > a.txt; printf 'b1\nb2\nb3\n' > b.txt
+    printf 'a1\na2\na3\n' > "$afile"; printf 'b1\nb2\nb3\n' > b.txt
     git add . && git commit -q -m "release 33.0.9" && git tag v33.0.9
     git branch master
-    printf 'a1\nA-UPSTREAM\na3\n' > a.txt
+    printf 'a1\nA-UPSTREAM\na3\n' > "$afile"
     git commit -qam "release 33.0.10"
     if [ "$tagkind" = final ]; then git tag v33.0.10; else git tag v33.0.10rc1; fi
     git push -q "$w/upstream.git" stable33 master --tags
@@ -58,7 +59,7 @@ world() {
     git fetch -q "$w/upstream.git" stable33
     git checkout -q -b ionos-dev-v33 "$(git -C "$w/upstream.git" rev-parse v33.0.9)"
     printf 'ours\n' > ionos-x.txt; git add . && git commit -q -m "IONOS(x): add file"
-    if [ "$kind" = conflict ]; then printf 'a1\nA-OURS\na3\n' > a.txt; else printf 'b1\nB-OURS\nb3\n' > b.txt; fi
+    if [ "$kind" = conflict ]; then printf 'a1\nA-OURS\na3\n' > "$afile"; else printf 'b1\nB-OURS\nb3\n' > b.txt; fi
     git commit -qam "IONOS(y): change a file"
     # the fork mirrors are at v33.0.9 (the stub's merge-upstream does not advance them)
     git push -q "$w/fork.git" ionos-dev-v33 \
@@ -117,7 +118,7 @@ case "$method $path" in
     cat "$S/workflows.json" ;;
   "PUT repos/"*/actions/workflows/*/disable)
     id="${path#*/workflows/}"; id="${id%/disable}"
-    [ "$(jq --argjson id "$id" '.workflows[]|select(.id==$id).deny // false' "$S/workflows.json")" = true ] && http 403 "Resource not accessible by integration"
+    [ "$(jq --argjson id "$id" '[.workflows[]|select(.id==$id).deny]|first // false' "$S/workflows.json")" = true ] && http 403 "Resource not accessible by integration"
     jq --argjson id "$id" '(.workflows[]|select(.id==$id)) |= (if .state != "active" then .redundant = true else . end | .state = "disabled_manually")' \
       "$S/workflows.json" > "$S/w.tmp" && mv "$S/w.tmp" "$S/workflows.json" ;;
   "GET repos/"*/issues)
@@ -267,7 +268,84 @@ sc_mirrors() {
   check "other steps still run (workflows disabled)" test "$(state_of mir409 1)" = disabled_manually
 }
 
-ALL="clean conflict idempotent_clean idempotent_conflict disable_workflows dry_run prerelease_ignored tag_override mirrors"
+sc_token() {
+  world tok clean final
+  run_sync tok HAS_SYNC_TOKEN=false
+  check "without the sync token the log says candidate pushes with workflow files are refused" \
+    grep -qi 'IONOS_SYNC_TOKEN.*workflow\|workflow.*IONOS_SYNC_TOKEN' "$ROOT/tok/out.log"
+  check "a missing sync token only warns, the run continues" test "$(cat "$ROOT/tok/status")" = 0
+  world tok2 clean final
+  run_sync tok2 HAS_SYNC_TOKEN=true
+  check "with the sync token there is no such warning" test "$(grep -c 'IONOS_SYNC_TOKEN' "$ROOT/tok2/out.log")" = 0
+  world tok3 clean final
+  run_sync tok3 HAS_SYNC_TOKEN=true GH_TOKEN=s3cret
+  check "the base64 form of the extraheader credential is masked" \
+    grep -qx '::add-mask::eC1hY2Nlc3MtdG9rZW46czNjcmV0' "$ROOT/tok3/out.log"
+  check "the mask comes before anything else could print it" test "$(grep -n 'add-mask' "$ROOT/tok3/out.log" | head -1 | cut -d: -f1)" = 1
+  check "the plain token never appears in the log" test "$(grep -c s3cret "$ROOT/tok3/out.log")" = 0
+}
+
+sc_issue_all_states() {
+  world iss conflict final
+  jq -n '[{"number":1,"title":"Rebase of ionos-dev-v33 onto v33.0.10 conflicts","body":"old","state":"closed"}]' > "$ROOT/iss/state/issues.json"
+  run_sync iss
+  check "a closed issue for the tag prevents a duplicate" test "$(n_issues iss)" = 1
+  check "run succeeds" test "$(cat "$ROOT/iss/status")" = 0
+  world del clean final
+  run_sync del
+  git -C "$ROOT/del/fork.git" update-ref -d "$CAND"
+  run_sync del
+  check "deleting a never-promoted candidate recreates it" test -n "$(fork_ref del $CAND)"
+}
+
+sc_isolation() {
+  world iso1 clean final
+  run_sync iso1 STUB_FAIL=workflows
+  check "failing workflow listing fails the run" test "$(cat "$ROOT/iso1/status")" != 0
+  check "failure is reported with ::error::" grep -q '::error::' "$ROOT/iso1/out.log"
+  check "mirror step still ran" test "$(fork_ref iso1 refs/heads/stable33)" = "$(git -C "$ROOT/iso1/upstream.git" rev-parse refs/heads/stable33)"
+  check "candidate step still ran" test -n "$(fork_ref iso1 $CAND)"
+  world iso2 clean final
+  cat > "$ROOT/iso2/fork.git/hooks/pre-receive" <<'HOOK'
+#!/bin/sh
+while read -r old new ref; do case "$ref" in refs/heads/candidate/*) echo "refused: workflow files" >&2; exit 1 ;; esac; done
+HOOK
+  chmod +x "$ROOT/iso2/fork.git/hooks/pre-receive"
+  run_sync iso2 HAS_SYNC_TOKEN=false
+  check "refused candidate push fails the run" test "$(cat "$ROOT/iso2/status")" != 0
+  check "refused push is reported with ::error::" grep -q '::error::.*candidate' "$ROOT/iso2/out.log"
+  check "mirror step still ran" test "$(fork_ref iso2 refs/heads/stable33)" = "$(git -C "$ROOT/iso2/upstream.git" rev-parse refs/heads/stable33)"
+  check "workflow step still ran" test "$(state_of iso2 1)" = disabled_manually
+}
+
+sc_dynamic_workflows() {
+  world dyn clean final
+  jq '.workflows += [{"id":5,"path":"dynamic/pages/pages-build-deployment","state":"active"},{"id":6,"path":".github/workflows/locked.yml","state":"active","deny":true}]' \
+    "$ROOT/dyn/state/workflows.json" > "$ROOT/dyn/w.tmp" && mv "$ROOT/dyn/w.tmp" "$ROOT/dyn/state/workflows.json"
+  run_sync dyn
+  check "dynamic workflows (path outside .github/workflows/) are skipped" test "$(state_of dyn 5)" = active
+  check "a 4xx on one workflow does not abort or fail the run" test "$(cat "$ROOT/dyn/status")" = 0
+  check "the 4xx is reported as a warning" grep -q '::warning::.*locked.yml' "$ROOT/dyn/out.log"
+  check "other workflows are still disabled" test "$(state_of dyn 1)$(state_of dyn 3)" = disabled_manuallydisabled_manually
+  check "candidate step still ran" test -n "$(fork_ref dyn $CAND)"
+}
+
+sc_issue_body_fence() {
+  world fence conflict-fence final
+  run_sync fence
+  local body; body="$(jq -r '.[0].body' "$ROOT/fence/state/issues.json")"
+  # lines inside a CommonMark fenced code block (a closing fence has at least as many backticks as the opening)
+  local inside
+  inside="$(awk '
+    fence == 0 && match($0, /^`+/) && RLENGTH >= 3 { fence = RLENGTH; next }
+    fence > 0 && match($0, /^`+[ \t]*$/) && RLENGTH >= fence { fence = 0; next }
+    fence > 0 { print }' <<<"$body")"
+  check "run succeeds" test "$(cat "$ROOT/fence/status")" = 0
+  check "a path that looks like a code fence stays inside the fenced list" grep -qxF '```' <<<"$inside"
+  check "the manual rebase instructions survive" grep -q 'git rebase --onto v33.0.10 v33.0.9' <<<"$inside"
+}
+
+ALL="clean conflict idempotent_clean idempotent_conflict disable_workflows dry_run prerelease_ignored tag_override mirrors token issue_all_states isolation dynamic_workflows issue_body_fence"
 if [ $# -gt 0 ]; then SELECT=("$@"); else read -r -a SELECT <<< "$ALL"; fi
 for s in "${SELECT[@]}"; do
   echo "scenario: $s"
