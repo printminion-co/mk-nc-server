@@ -1,0 +1,58 @@
+# Track upstream: fast-forward the master and stable33 mirrors, propose a rebased candidate
+# branch (candidate/ionos-dev-v33/<tag>) on a new upstream release, open an issue when the
+# rebase conflicts, and disable every workflow whose file does not start with ionos-.
+# The logic lives in .github/ionos/ionos-sync.sh (tested by ionos-sync.test.sh).
+#
+# NOTE: scheduled workflows only run from the repository's default branch, and a manual
+# run (workflow_dispatch) also needs the file on the default branch. Nothing here runs until
+# the default branch is switched to ionos-dev-v33 (a separate settings step by a person).
+
+name: IONOS sync with upstream
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Print what would be done and change nothing
+        type: boolean
+        default: false
+      upstream_tag:
+        description: Optional final release tag to use instead of the newest one (for testing)
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+  issues: write
+  actions: write
+  pull-requests: read
+
+concurrency:
+  group: ionos-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync mirrors, propose candidate, disable upstream workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # Only the script is needed; the repository has about 7.6 GB of history, so check out
+      # one commit and one directory. The script itself fetches just the refs it needs as a
+      # blobless partial clone.
+      - name: Check out the sync script
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          fetch-depth: 1
+          sparse-checkout: .github/ionos
+          persist-credentials: false
+
+      - name: Sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+        run: bash .github/ionos/ionos-sync.sh
