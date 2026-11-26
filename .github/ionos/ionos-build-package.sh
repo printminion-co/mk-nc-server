@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # For every flavor of the run: writes the app pins file, runs `ncw build` on the assembly tree
-# ($WORK/tree), then `ncw validate --artifact` on the zip, then writes <zip>.sha256. The first failure
-# stops the step (nothing after it runs, nothing is published). Only when every flavor passed does it
+# ($WORK/tree), then `ncw validate --artifact` on the zip, then writes <zip>.sha256. A failing flavor leaves
+# no archive and no checksum; the other flavors are still built, all failures are reported at the end and
+# the step fails (nothing is published). Only when every flavor passed does it
 # write $WORK/validated (a copy of flavors.txt), which the publish script requires. Needs jq and git.
 # All flavors share BUILD_NUMBER. No cache keys are passed (the cache comes with its own ticket).
 #
@@ -56,20 +57,32 @@ pins_file() {
   echo "$file"
 }
 
-rm -rf "$OUT"; mkdir -p "$OUT"
-rm -f "$WORK/validated"
-while read -r flavor; do
-  pins=$(pins_file "$flavor")
+# build_flavor <flavor>: build, validate, checksum. Returns 1 on the first problem of this flavor and leaves
+# no archive and no checksum of it behind. Explicit returns: it runs under `if !`, where `set -e` does nothing.
+build_flavor() {
+  local flavor="$1" pins zip
+  pins=$(pins_file "$flavor") || return 1
   log "building flavor $flavor (build $BUILD_NUMBER)"
   zip=$("${NCW_CMD[@]}" build --flavors "$FLAVORS_DIR" --flavor "$flavor" --tree "$TREE" --line "$LINE" --kind dev \
     --build-number "$BUILD_NUMBER" --out "$OUT" --server-commit "$SERVER_COMMIT" --flavors-commit "$FLAVORS_COMMIT" \
-    --app-pins "$pins") || die "the build of flavor $flavor failed"
-  [ -f "$zip" ] || die "the build of flavor $flavor printed '$zip', which is not a file"
+    --app-pins "$pins") || { warn "the build of flavor $flavor failed"; return 1; }
+  [ -f "$zip" ] || { warn "the build of flavor $flavor printed '$zip', which is not a file"; return 1; }
   log "validating $(basename "$zip")"
-  "${NCW_CMD[@]}" validate --flavors "$FLAVORS_DIR" --flavor "$flavor" --artifact "$zip" \
-    || die "the static checks of flavor $flavor failed: nothing will be published"
-  ( cd "$OUT" && sha256sum "$(basename "$zip")" > "$(basename "$zip").sha256" )
+  if ! "${NCW_CMD[@]}" validate --flavors "$FLAVORS_DIR" --flavor "$flavor" --artifact "$zip"; then
+    rm -f "$zip"
+    warn "the static checks of flavor $flavor failed"
+    return 1
+  fi
+  ( cd "$OUT" && sha256sum "$(basename "$zip")" > "$(basename "$zip").sha256" ) || return 1
+}
+
+rm -rf "$OUT"; mkdir -p "$OUT"
+rm -f "$WORK/validated"
+failed=()
+while read -r flavor; do
+  if ! build_flavor "$flavor"; then failed+=("$flavor"); fi
 done < "$WORK/flavors.txt"
 
+[ ${#failed[@]} -eq 0 ] || die "these flavors failed: ${failed[*]}; nothing will be published"
 cp "$WORK/flavors.txt" "$WORK/validated"
 log "built and validated: $(paste -sd' ' "$WORK/flavors.txt")"
