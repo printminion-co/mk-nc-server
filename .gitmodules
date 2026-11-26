@@ -74,3 +74,18 @@
 [submodule "apps-upstream/viewer"]
 	path = apps-upstream/viewer
 	url = https://github.com/nextcloud/viewer.git
+[submodule "apps-flavor1/contacts"]
+	path = apps-flavor1/contacts
+	url = https://github.com/nextcloud/contacts.git
+[submodule "apps-flavor1/calendar"]
+	path = apps-flavor1/calendar
+	url = https://github.com/nextcloud/calendar.git
+[submodule "apps-flavor1/tasks"]
+	path = apps-flavor1/tasks
+	url = https://github.com/nextcloud/tasks.git
+[submodule "apps-flavor1/groupfolders"]
+	path = apps-flavor1/groupfolders
+	url = https://github.com/nextcloud/groupfolders.git
+[submodule "apps-flavor1/notes"]
+	path = apps-flavor1/notes
+	url = https://github.com/nextcloud/notes.git
