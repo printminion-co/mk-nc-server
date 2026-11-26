@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Resolves the flavors of a run and selects the out-of-tree apps they need. Writes, in $WORK:
 #   flavors.txt        the flavors to build, one per line
+#   scope              all when that is every flavor of IONOS/flavors, else subset
 #   apps/<flavor>.txt  the out-of-tree apps of that flavor, as paths <app folder>/<app id>
 #   apps-all.txt       the union of those, sorted
 #   resolved/<flavor>.yaml   what `ncw resolve` printed, for the log and for later steps
@@ -37,7 +38,7 @@ mkdir -p "$WORK/apps" "$WORK/resolved"
 
 if [ -z "$FLAVORS" ]; then
   for d in "$FLAVORS_DIR"/flavors/*/; do
-    [ -f "$d/flavor.yaml" ] && basename "$d"
+    if [ -f "$d/flavor.yaml" ]; then basename "$d"; fi
   done | sort > "$WORK/flavors.txt"
 else
   IFS=',' read -r -a want <<<"$FLAVORS"
@@ -50,6 +51,13 @@ else
   done | sort -u > "$WORK/flavors.txt"
 fi
 [ -s "$WORK/flavors.txt" ] || die "no flavors to build"
+# scope all = every flavor of IONOS/flavors; the flavors commit fixes that set
+for d in "$FLAVORS_DIR"/flavors/*/; do
+  if [ -f "$d/flavor.yaml" ]; then basename "$d"; fi
+done | sort > "$WORK/flavors-found.txt"
+if cmp -s "$WORK/flavors.txt" "$WORK/flavors-found.txt"; then echo all > "$WORK/scope"; else echo subset > "$WORK/scope"; fi
+rm -f "$WORK/flavors-found.txt"
+log "scope: $(cat "$WORK/scope")"
 log "flavors: $(paste -sd' ' "$WORK/flavors.txt")"
 
 while read -r flavor; do

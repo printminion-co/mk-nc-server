@@ -15,6 +15,8 @@ read -r -a NPM_CMD <<<"${NPM:-npm}"
 cd "$ROOT"
 
 rm -rf dist
+# No --ignore-scripts: the server's postinstall (build/demi.sh ci) installs the frontend builds that
+# `npm run build` needs.
 log "server: npm ci"
 "${NPM_CMD[@]}" ci || die "server: npm ci failed"
 log "server: npm run build"

@@ -87,10 +87,11 @@ newworld() {
   echo '[]' > "$w/state/releases.json"
   : > "$w/state/calls.log"
 }
-# addrel <world> <tag> <prerelease true|false> [<server_commit> <flavors_commit>]
+# addrel <world> <tag> <prerelease true|false> [<server_commit> <flavors_commit> [<flavors_scope: all|subset|empty for none>]]
 addrel() {
-  local body=""
+  local body="" scope="${6-all}"
   [ -n "${4:-}" ] && body=$'Dev build\n\nserver_commit: '"$4"$'\nflavors_commit: '"$5"$'\n'
+  [ -n "${4:-}" ] && [ -n "$scope" ] && body+="flavors_scope: $scope"$'\n'
   jq --arg t "$2" --argjson p "$3" --arg b "$body" '. + [{"tag_name":$t,"prerelease":$p,"draft":false,"body":$b}]' \
     "$ROOT/$1/state/releases.json" > "$ROOT/$1/state/r.tmp" && mv "$ROOT/$1/state/r.tmp" "$ROOT/$1/state/releases.json"
 }
@@ -101,7 +102,7 @@ run_in() {
   ( cd "$w/repo" 2>/dev/null || cd "$w" || exit 1
     : > "$w/gh_output"
     env PATH="$ROOT/bin:$PATH" STUB_STATE="$w/state" GITHUB_REPOSITORY=acme/server GITHUB_OUTPUT="$w/gh_output" "$@" \
-      bash "$HERE/$script" > "$w/out.log" 2>&1
+      bash "$HERE/$script" ${SCRIPT_ARGS:+"$SCRIPT_ARGS"} > "$w/out.log" 2>&1
     echo $? > "$w/status" )
 }
 status() { cat "$ROOT/$1/status"; }
@@ -161,6 +162,24 @@ sc_plan() {
   addrel p5 v33.0.9 true "$(head_of p5)" "$FLAVORS_SHA"
   run_in p5 ionos-build-plan.sh EVENT_NAME=schedule KIND=dev REF_NAME=ionos-dev-v33
   check "only dev- pre-releases count (a final release or another pre-release does not)" test "$(output p5 build)" = true
+
+  newworld p7; repo p7
+  addrel p7 dev-v33.0.9.5 true "$(head_of p7)" "$FLAVORS_SHA" subset
+  run_in p7 ionos-build-plan.sh EVENT_NAME=schedule KIND=dev REF_NAME=ionos-dev-v33
+  check "a subset run is no baseline: the scheduled run builds although the commits are the same" test "$(output p7 build)" = true
+  newworld p8; repo p8
+  addrel p8 dev-v33.0.9.4 true "$(head_of p8)" "$FLAVORS_SHA" all
+  addrel p8 dev-v33.0.9.5 true "$(head_of p8)" "$FLAVORS_SHA" subset
+  run_in p8 ionos-build-plan.sh EVENT_NAME=schedule KIND=dev REF_NAME=ionos-dev-v33
+  check "a subset run after a full run: the previous pre-release is the subset one, so it builds" test "$(output p8 build)" = true
+  newworld p9; repo p9
+  addrel p9 dev-v33.0.9.5 true "$(head_of p9)" "$FLAVORS_SHA" ""
+  run_in p9 ionos-build-plan.sh EVENT_NAME=schedule KIND=dev REF_NAME=ionos-dev-v33
+  check "a pre-release that does not say which flavors it covered is no baseline" test "$(output p9 build)" = true
+  run_in p9 ionos-build-plan.sh EVENT_NAME=workflow_dispatch KIND=dev REF_NAME=ionos-dev-v33 FLAVORS=flavor1
+  check "plan accepts the flavors input" test "$(status p9)" = 0
+  run_in p9 ionos-build-plan.sh EVENT_NAME=workflow_dispatch KIND=dev REF_NAME=ionos-dev-v33 'FLAVORS=a/../b'
+  check "plan refuses a flavors input with a bad name early" test "$(status p9)" != 0
 
   newworld p6; repo p6
   run_in p6 ionos-build-plan.sh EVENT_NAME=workflow_dispatch KIND=release REF_NAME=ionos-dev-v33
@@ -229,7 +248,7 @@ pubworld() {
     (cd "$w/out" && sha256sum "ncw-$f-v33.0.9.42.zip" > "ncw-$f-v33.0.9.42.zip.sha256")
   done
   printf 'flavor1\nflavor2\n' > "$w/flavors.txt"
-  echo 33.0.9 > "$w/base-release"
+  echo 33.0.9 > "$w/base-release"; echo all > "$w/scope"
   cp "$w/flavors.txt" "$w/validated"
 }
 PUB="BUILD_NUMBER=42 SERVER_COMMIT=aaaaaaa FLAVORS_COMMIT=bbbbbbb RUN_URL=https://example.invalid/run/1"
@@ -248,6 +267,7 @@ sc_publish() {
   check "body lists the flavors and links the run" bash -c "grep -q 'flavor1' <<<'$body' && grep -q 'flavor2' <<<'$body' && grep -q 'https://example.invalid/run/1' <<<'$body'"
   check "the planner reads the body back" bash -c "test \"\$(cd '$ROOT/u1' && . '$HERE/ionos-lib.sh' && body_value server_commit <<<'$body')\" = aaaaaaa"
 
+  check "body names the scope and the flavors of the run" bash -c "grep -qx 'flavors_scope: all' <<<'$body' && grep -qx 'flavors: flavor1,flavor2' <<<'$body'"
   pubworld u2; echo bundle > "$ROOT/u2/work/out/ncw-build-42.attestation.jsonl"
   # shellcheck disable=SC2086
   run_in u2 ionos-build-publish.sh WORK="$ROOT/u2/work" $PUB
@@ -273,6 +293,31 @@ sc_publish() {
   run_in u6 ionos-build-publish.sh WORK="$ROOT/u6/work" $PUB
   check "a flavor of the run without an archive fails before any release call" test "$(status u6)" != 0 -a "$(n_calls u6 'release create')" = 0
 
+  pubworld c1
+  # shellcheck disable=SC2086
+  SCRIPT_ARGS=--check run_in c1 ionos-build-publish.sh WORK="$ROOT/c1/work" $PUB
+  check "--check passes for a good run and makes no release call" test "$(status c1)" = 0 -a "$(n_calls c1 'release create')" = 0
+  pubworld c2; echo corrupt >> "$ROOT/c2/work/out/ncw-flavor1-v33.0.9.42.zip"
+  # shellcheck disable=SC2086
+  SCRIPT_ARGS=--check run_in c2 ionos-build-publish.sh WORK="$ROOT/c2/work" $PUB
+  check "--check fails when an archive does not match its checksum" test "$(status c2)" != 0
+  pubworld c3; rm "$ROOT/c3/work/validated"
+  # shellcheck disable=SC2086
+  SCRIPT_ARGS=--check run_in c3 ionos-build-publish.sh WORK="$ROOT/c3/work" $PUB
+  check "--check fails without the validated marker" test "$(status c3)" != 0
+  pubworld c4; echo flavor1 > "$ROOT/c4/work/validated"
+  # shellcheck disable=SC2086
+  SCRIPT_ARGS=--check run_in c4 ionos-build-publish.sh WORK="$ROOT/c4/work" $PUB
+  check "--check fails when the marker does not match the flavor list" test "$(status c4)" != 0
+  pubworld c5; addrel c5 dev-v33.0.9.42 true
+  # shellcheck disable=SC2086
+  SCRIPT_ARGS=--check run_in c5 ionos-build-publish.sh WORK="$ROOT/c5/work" $PUB
+  check "--check fails when the release exists already" test "$(status c5)" != 0
+  pubworld c6; echo weird > "$ROOT/c6/work/scope"
+  # shellcheck disable=SC2086
+  SCRIPT_ARGS=--check run_in c6 ionos-build-publish.sh WORK="$ROOT/c6/work" $PUB
+  check "--check fails on an unknown scope" test "$(status c6)" != 0
+
   pubworld u7
   # shellcheck disable=SC2086
   run_in u7 ionos-build-publish.sh WORK="$ROOT/u7/work" $PUB DRY_RUN=true
@@ -288,9 +333,10 @@ name="$(basename "$0")"
 echo "${PWD#"$CMD_BASE"/}: $name $*" >> "$CMD_LOG"
 case "$name $1 $2" in
   "npm-stub ci "*) mkdir -p node_modules/dep && echo dev > node_modules/dep/index.js ;;
-  "npm-stub run build") [ "${NPM_FAIL:-}" = "$(basename "$PWD")" ] && exit 1; mkdir -p js && echo built > js/built.js
+  "npm-stub run build") [ "${NPM_FAIL:-}" = "$(basename "$PWD")" ] && exit 1
+     [ "${NPM_NOBUILD:-}" = "$(basename "$PWD")" ] || { mkdir -p js && echo built > js/built.js; }
      [ "$(basename "$PWD")" = "$(basename "$CMD_BASE")" ] && { mkdir -p dist && echo built > dist/core.js; } ;;
-  "composer-stub install "*) mkdir -p vendor/pkg/tests && echo x > vendor/pkg/tests/t.php && echo x > vendor/autoload.php ;;
+  "composer-stub install "*) [ "${COMPOSER_NOBUILD:-}" = "$(basename "$PWD")" ] || { mkdir -p vendor/pkg/tests && echo x > vendor/pkg/tests/t.php && echo x > vendor/autoload.php; } ;;
 esac
 exit 0
 STUB
@@ -308,23 +354,30 @@ echo "ncw $cmd ${A[flavor]:-} kind=${A[kind]:-} bn=${A[build-number]:-} line=${A
 case "$cmd" in
   resolve) cat "$RESOLVE_DIR/${A[flavor]}.yaml" ;;
   build)
-    [ "${BUILD_FAIL:-}" = "${A[flavor]}" ] && { echo "ncw: boom" >&2; exit 2; }
+    [[ ",${BUILD_FAIL:-}," == *",${A[flavor]},"* ]] && { echo "ncw: boom" >&2; exit 2; }
     [ -n "${A[app-pins]:-}" ] && cp "${A[app-pins]}" "$NCW_LOG.pins.${A[flavor]}"
     mkdir -p "${A[out]}"; f="${A[out]}/ncw-${A[flavor]}-v33.0.9.${A[build-number]}.zip"
     echo "zip ${A[flavor]}" > "$f"; echo "$f" ;;
-  validate) [ "${VALIDATE_FAIL:-}" = "${A[flavor]}" ] && { echo "ncw: invalid" >&2; exit 2; }; exit 0 ;;
+  validate) [[ ",${VALIDATE_FAIL:-}," == *",${A[flavor]},"* ]] && { echo "ncw: invalid" >&2; exit 2; }; exit 0 ;;
 esac
 STUB
 chmod +x "$ROOT/bin/ncw-stub"
 
 # ---------------------------------------------------------------- a fork-like world
-# mkapp <name>: a local "upstream app" repository with a composer.json, a package.json with a build script,
+# mkapp <name> [both|composer|plainjs|static]: a local "upstream app" repository with a composer.json, a package.json with a build script,
 # and a .nextcloudignore
 mkapp() {
-  local d="$ROOT/src/$1"; mkdir -p "$d/src" "$d/tests" "$d/lib"
+  local kind="${2:-both}" d="$ROOT/src/$1"; mkdir -p "$d/src" "$d/tests" "$d/lib"
   git init -q "$d"; git -C "$d" config uploadpack.allowAnySHA1InWant true
-  echo '{"require":{"x/y":"1"}}' > "$d/composer.json"
-  echo '{"scripts":{"build":"x"}}' > "$d/package.json"
+  case "$kind" in
+    both) echo '{"require":{"x/y":"1"}}' > "$d/composer.json"; echo '{"scripts":{"build":"x"}}' > "$d/package.json" ;;
+    composer) echo '{"require":{"x/y":"1"}}' > "$d/composer.json" ;;
+    plainjs) echo '{"name":"no-build-script"}' > "$d/package.json" ;;
+    static) ;;
+  esac
+  # committed built output, which must never be trusted
+  case "$kind" in both|composer) mkdir -p "$d/vendor"; echo stale > "$d/vendor/stale.php" ;; esac
+  case "$kind" in both|plainjs|static) mkdir -p "$d/js"; echo stale > "$d/js/stale.js" ;; esac
   printf '/src\ntests\n.nextcloudignore\n' > "$d/.nextcloudignore"
   echo s > "$d/src/s.js"; echo t > "$d/tests/t.php"; echo l > "$d/lib/l.php"
   git -C "$d" add -A; git -C "$d" commit -q -m "app $1"; git -C "$d" tag v1.0.0
@@ -405,12 +458,25 @@ sc_select() {
 
   run_build s1 ionos-build-select.sh FLAVORS="flavor2"
   check "a flavor list selects only those flavors" test "$(cat "$ROOT/s1/work/flavors.txt")" = flavor2
+  check "a subset is recorded as scope subset" test "$(cat "$ROOT/s1/work/scope")" = subset
   run_build s1 ionos-build-select.sh FLAVORS="flavor1, flavor2"
   check "the list tolerates spaces" test "$(cat "$ROOT/s1/work/flavors.txt")" = "$(printf 'flavor1\nflavor2')"
+  run_build s1 ionos-build-select.sh FLAVORS="flavor1, flavor2"
+  check "naming every flavor is scope all" test "$(cat "$ROOT/s1/work/scope")" = all
+  run_build s1 ionos-build-select.sh
+  check "no list is scope all" test "$(cat "$ROOT/s1/work/scope")" = all
   run_build s1 ionos-build-select.sh FLAVORS="nope"
   check "an unknown flavor fails" test "$(status s1)" != 0
   run_build s1 ionos-build-select.sh 'FLAVORS=../x'
   check "a flavor name with a path is refused" test "$(status s1)" != 0
+
+  # a folder of IONOS/flavors without flavor.yaml (sorted last) is not a flavor and must not stop the step
+  mkdir -p "$ROOT/s1/repo/IONOS/flavors/zzz-notes"
+  run_build s1 ionos-build-select.sh
+  check "a folder without flavor.yaml is skipped, the others are still selected" test "$(status s1)" = 0 -a "$(cat "$ROOT/s1/work/flavors.txt")" = "$(printf 'flavor1\nflavor2')"
+  rm -f "$ROOT/s1/repo/IONOS/flavors/flavor1/flavor.yaml" "$ROOT/s1/repo/IONOS/flavors/flavor2/flavor.yaml"
+  run_build s1 ionos-build-select.sh
+  check "no flavor at all fails with a message" test "$(status s1)" != 0 -a -n "$(grep 'no flavors' "$ROOT/s1/out.log")"
 
   # none: a flavor whose app folder does not exist in the fork and that has no out-of-tree apps
   fork s2
@@ -445,6 +511,8 @@ sc_apps() {
   check "default recipe: composer install --no-dev -a" grep -q 'apps-x/a: composer-stub install --no-dev -a' "$ROOT/a1/cmd.log"
   check "default recipe: npm ci then npm run build" bash -c "grep -n 'apps-x/a: npm-stub' '$ROOT/a1/cmd.log' | cut -d: -f3- | tr '\n' ';' | grep -q 'npm-stub ci.*npm-stub run build'"
   check "default recipe: built files are there" test -f "$r/apps-x/a/js/built.js" -a -f "$r/apps-x/a/vendor/autoload.php"
+  check "default recipe: committed built output is deleted before the build (vendor/ and js/)" test ! -e "$r/apps-x/a/vendor/stale.php" -a ! -e "$r/apps-x/a/js/stale.js"
+  check "default recipe: npm ci runs with --ignore-scripts" grep -q 'apps-x/a: npm-stub ci --ignore-scripts' "$ROOT/a1/cmd.log"
   check "default recipe: node_modules is deleted afterwards" test ! -e "$r/apps-x/a/node_modules"
   check "a recipe in build-recipes replaces the default for that app" test -f "$r/apps-x/b/recipe-ran"
   check "the recipe knows the app id" grep -q 'recipe for b' "$r/apps-x/b/recipe-ran"
@@ -456,6 +524,29 @@ sc_apps() {
   run_build a2 ionos-build-apps.sh NPM_FAIL=a
   check "a failing app build fails the step" test "$(status a2)" != 0
   check "the failing app is named" logged a2 '::error::.*\ba\b'
+
+  # the rule for built files (see ionos-build.md)
+  mkapp ca composer; mkapp cb both; mkapp cc plainjs; mkapp cd static; mkapp ce both
+  fork a4 ca; run_build a4 ionos-build-select.sh; run_build a4 ionos-build-apps.sh
+  check "composer-only app: built from source, vendor/ comes from composer" test "$(status a4)" = 0 -a -f "$ROOT/a4/repo/apps-x/ca/vendor/autoload.php" -a ! -e "$ROOT/a4/repo/apps-x/ca/vendor/stale.php"
+  check "composer-only app: no npm call" test "$(grep -c 'apps-x/ca: npm' "$ROOT/a4/cmd.log")" = 0
+  fork a5 ca; run_build a5 ionos-build-select.sh; run_build a5 ionos-build-apps.sh COMPOSER_NOBUILD=ca
+  check "an app with a composer.json whose build produced no vendor/ fails and is named" test "$(status a5)" != 0 -a -n "$(grep '::error::.*ca' "$ROOT/a5/out.log")"
+  fork a6 cb; run_build a6 ionos-build-select.sh; run_build a6 ionos-build-apps.sh NPM_NOBUILD=cb
+  check "an app with a build script that produced no js/ or css/ fails and is named" test "$(status a6)" != 0 -a -n "$(grep '::error::.*cb' "$ROOT/a6/out.log")"
+  fork a7 cc; run_build a7 ionos-build-select.sh; run_build a7 ionos-build-apps.sh
+  check "committed js/ without a build script and without a recipe fails and is named" test "$(status a7)" != 0 -a -n "$(grep '::error::.*cc' "$ROOT/a7/out.log")"
+  check "that failure happens before anything is deleted or built" test ! -e "$ROOT/a7/cmd.log" -o "$(grep -c 'apps-x/cc' "$ROOT/a7/cmd.log" 2>/dev/null)" = 0
+  fork a8 cd; run_build a8 ionos-build-select.sh; run_build a8 ionos-build-apps.sh
+  check "committed js/ with no package.json and no recipe fails too" test "$(status a8)" != 0
+  fork a9 ce; run_build a9 ionos-build-select.sh
+  mkdir -p "$ROOT/a9/repo/.github/ionos/build-recipes"; printf '#!/usr/bin/env bash\nset -euo pipefail\nrm -rf js\necho ok > ok\n' > "$ROOT/a9/repo/.github/ionos/build-recipes/ce.sh"
+  run_build a9 ionos-build-apps.sh
+  check "a recipe is trusted to build what it says: no check, no default build" test "$(status a9)" = 0 -a -f "$ROOT/a9/repo/apps-x/ce/ok" -a ! -s "$ROOT/a9/cmd.log"
+  mkapp cf plainjs; fork a10 cf
+  mkdir -p "$ROOT/a10/repo/.github/ionos/build-recipes"; printf '#!/usr/bin/env bash\ntrue\n' > "$ROOT/a10/repo/.github/ionos/build-recipes/cf.sh"
+  run_build a10 ionos-build-select.sh; run_build a10 ionos-build-apps.sh
+  check "an app with committed js/ and no build script is fine with a recipe" test "$(status a10)" = 0
 
   fork a3
   run_build a3 ionos-build-select.sh
@@ -469,6 +560,7 @@ sc_server() {
   run_build v1 ionos-build-server.sh
   check "server build succeeds" test "$(status v1)" = 0
   check "npm ci runs before npm run build" bash -c "tr '\n' ';' < '$ROOT/v1/cmd.log' | grep -q 'npm-stub ci.*npm-stub run build'"
+  check "the server needs its postinstall (build/demi.sh ci): npm ci runs WITHOUT --ignore-scripts" test "$(grep -c 'ignore-scripts' "$ROOT/v1/cmd.log")" = 0
   check "the committed dist is never trusted: stale files of it are gone" test ! -e "$ROOT/v1/repo/dist/stale.js"
   check "the built dist is there" test "$(cat "$ROOT/v1/repo/dist/core.js")" = built
   fork v2
@@ -553,6 +645,12 @@ sc_package() {
   check "and makes no gh release call" test "$(n_calls k3 'release')" = 0
   run_build k3 ionos-build-package.sh BUILD_NUMBER=9 LINE=33 SERVER_COMMIT=$sha FLAVORS_COMMIT=$fsha BUILD_FAIL=flavor1
   check "a failing build fails the package step" test "$(status k3)" != 0
+  check "the remaining flavors are still built after a failure" grep -q '^ncw build flavor2' "$ROOT/k3/ncw.log"
+  run_build k3 ionos-build-package.sh BUILD_NUMBER=9 LINE=33 SERVER_COMMIT=$sha FLAVORS_COMMIT=$fsha BUILD_FAIL=flavor1 VALIDATE_FAIL=flavor2
+  check "all failing flavors are reported" test -n "$(grep '::error::.*flavor1.*flavor2' "$ROOT/k3/out.log")"
+  run_build k3 ionos-build-package.sh BUILD_NUMBER=9 LINE=33 SERVER_COMMIT=$sha FLAVORS_COMMIT=$fsha VALIDATE_FAIL=flavor2
+  check "a flavor that failed validation leaves no archive and no checksum" test ! -e "$ROOT/k3/work/out/ncw-flavor2-v33.0.9.9.zip" -a ! -e "$ROOT/k3/work/out/ncw-flavor2-v33.0.9.9.zip.sha256"
+  check "a flavor that passed keeps its archive and checksum" test -f "$ROOT/k3/work/out/ncw-flavor1-v33.0.9.9.zip.sha256"
   run_build k3 ionos-build-package.sh BUILD_NUMBER=0 LINE=33 SERVER_COMMIT=$sha FLAVORS_COMMIT=$fsha
   check "a bad build number is refused" test "$(status k3)" != 0
 }

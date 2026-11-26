@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Publishes the archives of a run as ONE GitHub pre-release. Needs gh and the files the package step
-# left in $WORK/out. Refuses (before any release call) when an archive has no checksum, when a flavor of
+# Publishes the archives of a run as ONE GitHub pre-release. Needs gh and the files the build job handed
+# over in $WORK. With --check it only runs the gate (everything below that refuses) and publishes nothing:
+# the workflow runs it before the attestation, so only archives that pass are attested. Refuses (before any release call) when an archive has no checksum, when a flavor of
 # the run has no archive, when the run did not validate every flavor, or when the release for this build number already exists.
 #
 # Environment:
 #   WORK                the run's work folder: out/ (archives, .sha256 files, optional *.attestation.jsonl),
-#                       flavors.txt (one flavor per line), base-release (for example 33.0.9)
+#                       flavors.txt (one flavor per line), validated, scope (all or subset),
+#                       base-release (for example 33.0.9)
 #   BUILD_NUMBER        the run number
 #   SERVER_COMMIT, FLAVORS_COMMIT   the commits built (recorded in the release body)
 #   RUN_URL             link to the workflow run
@@ -17,6 +19,13 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 export LOG_PREFIX=ionos-build
 # shellcheck source=ionos-lib.sh
 . "$HERE/ionos-lib.sh"
+
+CHECK_ONLY=false
+case "${1:-}" in
+  "") ;;
+  --check) CHECK_ONLY=true ;;
+  *) die "unknown argument '$1'" ;;
+esac
 
 WORK=${WORK:?WORK is required}
 BUILD_NUMBER=${BUILD_NUMBER:?BUILD_NUMBER is required}
@@ -50,10 +59,18 @@ while read -r f; do
   flavors+=("$f")
 done < "$WORK/flavors.txt"
 [ ${#flavors[@]} -gt 0 ] || die "no flavors recorded in $WORK/flavors.txt"
+( cd "$OUT" && sha256sum --check --quiet -- *.zip.sha256 ) || die "an archive does not match its checksum"
+SCOPE=$(cat "$WORK/scope" 2>/dev/null || true)
+[ "$SCOPE" = all ] || [ "$SCOPE" = subset ] || die "the scope of the run is '$SCOPE', expected all or subset"
 for b in "$OUT"/*.attestation.jsonl; do assets+=("$b"); done
 
 if gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
   die "the release $TAG exists already: a re-run of a finished run keeps its build number; start a new run"
+fi
+
+if [ "$CHECK_ONLY" = true ]; then
+  log "checks passed for $TAG: ${#zips[@]} archive(s), flavors $(paste -sd' ' "$WORK/flavors.txt")"
+  exit 0
 fi
 
 notes="$WORK/release-notes.md"
@@ -64,6 +81,8 @@ notes="$WORK/release-notes.md"
   echo "flavors_commit: $FLAVORS_COMMIT"
   echo "build_number: $BUILD_NUMBER"
   echo "base_release: v$BASE"
+  echo "flavors_scope: $SCOPE"
+  echo "flavors: $(IFS=,; echo "${flavors[*]}")"
   echo
   echo "Flavors:"
   for f in "${flavors[@]}"; do echo "- $f"; done
