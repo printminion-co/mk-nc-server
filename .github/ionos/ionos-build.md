@@ -22,27 +22,45 @@ separate settings ticket). The run must be on `ionos-dev-v<nn>`: the line is der
 ## Jobs and steps
 
 `plan` (read-only token, one commit, only `.github/ionos`): `ionos-build-plan.sh` rejects `kind`
-release, derives the line, and decides. A manual run always builds. A scheduled run skips (logged, the run
-succeeds) when the server commit (`HEAD`) and the flavors commit (the `IONOS` submodule entry) are the
-same as the ones recorded in the newest dev pre-release. The newest is the one with the highest build
-number among published pre-releases whose tag is `dev-v<a>.<b>.<c>.<n>`. `force` builds anyway.
+release, checks the names in the `flavors` input, derives the line, and decides. A manual run always
+builds. A scheduled run skips (logged, the run succeeds) only when the newest dev pre-release (highest
+build number among published pre-releases whose tag is `dev-v<a>.<b>.<c>.<n>`) covered ALL flavors
+(its body line `flavors_scope: all`) and its `server_commit` (`HEAD`) and `flavors_commit` (the `IONOS`
+submodule entry) equal the current ones. The flavors commit fixes the set of flavors, so "all" then is
+"all" now. A pre-release of a subset run (`flavors` input) or one without the line is never a baseline:
+the scheduled run builds. `force` builds anyway.
 
-`build` (only if `plan` says so; permissions `contents: write`, `id-token: write`,
-`attestations: write`; `plan` has only `contents: read`; timeout 120 minutes; concurrency group
-`ionos-build`, no cancelling):
+Three jobs, so that third-party app code never meets a write token:
+
+**`build`** (permissions `contents: read` only; timeout 120 minutes; concurrency group `ionos-build`,
+no cancelling) runs everything that executes app code and ends by uploading the workflow artifact
+`ionos-build` (archives, checksums, `flavors.txt`, `validated`, `scope`, `base-release`):
 
 1. Check out the dev branch (depth 1) and only the submodules `3rdparty` and `IONOS` (depth 1).
 2. Node from the server's `package.json` `engines`; `ionos-build-server.sh`: deletes the committed
-   `dist/`, `npm ci && npm run build`, fails when `dist/` stays empty. Composer is not run for the server
-   (`3rdparty` is its vendor folder, as upstream).
+   `dist/`, `npm ci && npm run build`, fails when `dist/` stays empty. This `npm ci` runs lifecycle
+   scripts on purpose: the server's `postinstall` (`build/demi.sh ci`) installs the frontend builds. Composer
+   is not run for the server (`3rdparty` is its vendor folder, as upstream).
 3. Node 24 for the tool (it runs TypeScript natively); `npm ci --ignore-scripts` in `IONOS/tools`.
 4. `ionos-build-select.sh`: `ncw resolve` for every flavor; the out-of-tree apps of a flavor are the
    entries of its ACTIVE app folders (read from the commit) whose mode is not `removed`. None is fine.
-5. `ionos-build-apps.sh`: initialises only those submodules (depth 1) and builds each from source.
-   Default recipe: `composer install --no-dev -a` when `composer.json` exists, then `npm ci && npm run build`
-   when `package.json` has a `build` script, then `node_modules` is deleted. A script
-   `.github/ionos/build-recipes/<app id>.sh` replaces the default for that app (run in the app folder,
-   `APP` set; use `set -euo pipefail`).
+   It also writes `scope` (`all` when the selected flavors are every flavor of `IONOS/flavors`).
+5. `ionos-build-apps.sh`: initialises only those submodules (depth 1) and builds each from source, by
+   this rule. A script `.github/ionos/build-recipes/<app id>.sh` replaces the default for that app: it is
+   run in the app folder with `APP` set (use `set -euo pipefail`), it owns what it deletes and builds, and
+   no check is made on its result. Without a recipe the default recipe applies, and built files are never
+   trusted:
+   - committed files in `js/` or `css/`, no `package.json` build script and no recipe: the step FAILS
+     naming the app (add a recipe, even a no-op one that states the files are sources);
+   - `composer.json`: `vendor/` is deleted, `composer install --no-dev -a` runs and `vendor/autoload.php`
+     must exist, else the step fails naming the app;
+   - `package.json` with a `build` script: `js/` and `css/` are deleted, `npm ci --ignore-scripts && npm run
+     build` runs, and `js/` or `css/` must contain files, else the step fails naming the app (an app that
+     builds elsewhere needs a recipe);
+   - `node_modules` is deleted afterwards.
+   `--ignore-scripts` is used for the apps because most do not need lifecycle scripts (as for the tool itself); an app
+   that needs a `postinstall` has to use a recipe. The server cannot use it (see 2). An app that keeps
+   handwritten files in `js/` or `css/` also needs a recipe, because the default recipe deletes those dirs.
 6. `ionos-build-assemble.sh`: a CLEAN tree in `$WORK/tree` (the tool loads it all into memory), done as
    upstream's release build does (`nextcloud-releases/server`, `.github/scripts`): copy without `.git`,
    `node_modules`, `IONOS`; `3rdparty` without `.git .github .gitignore README.md`; remove what the root
@@ -54,24 +72,33 @@ number among published pre-releases whose tag is `dev-v<a>.<b>.<c>.<n>`. `force`
    submodule apps (`git submodule status` must show the pinned commit; `describe` is `git describe --tags
    --always` after a blobless unshallow fetch), then `ncw build --kind dev --build-number <run number>
    --line <nn> --server-commit <HEAD> --flavors-commit <IONOS sha> --app-pins <file>` (no `--cache-keys`:
-   the cache is a later ticket), then `ncw validate --artifact`, then `<zip>.sha256`. The first failure
-   stops the run, before anything is published. The step writes `$WORK/validated` only when every flavor
-   passed; the publish script refuses to run without it.
-8. `actions/attest-build-provenance` on the zips; the bundle is attached to the release as
+   the cache is a later ticket), then `ncw validate --artifact`, then `<zip>.sha256`. A failing flavor
+   leaves no archive; the other flavors still run, all failures are reported at the end and the step fails.
+   `$WORK/validated` is written only when every flavor passed.
+8. Upload of the artifact (`actions/upload-artifact`), only reached when everything above passed.
+
+**`publish`** (needs `plan` and `build`; permissions `contents: write`, `id-token: write`,
+`attestations: write`; runs no npm, no composer and no app code: it checks out only `.github/ionos`):
+
+1. Download the artifact (`actions/download-artifact`).
+2. `ionos-build-publish.sh --check`: the gate. Refuses unless `validated` equals the flavor list, every
+   flavor has an archive, every archive matches its checksum, the scope is `all` or `subset`, and the
+   release for the tag does not exist yet. Nothing is attested before it passes.
+3. `actions/attest-build-provenance` on the zips; the bundle is attached to the release as
    `ncw-build-<n>.attestation.jsonl`. Check with `gh attestation verify <zip> -R <repo>`.
-9. `ionos-build-publish.sh`: one `gh release create` with the default token: tag
+4. `ionos-build-publish.sh`: runs the gate again, then one `gh release create` with the default token: tag
    `dev-v<base release>.<build number>` on the built commit (`--target <sha>`, for example
    `dev-v33.0.9.42`), `--prerelease`, title `Dev build <n> (v<base> base)`, assets every zip, its `.sha256`
    and the attestation bundle. The body has machine-readable lines (`server_commit:`, `flavors_commit:`,
-   `build_number:`, `base_release:`), the flavor list and a link to the run. An existing release for the tag
-   (a re-run of a finished run keeps its number) fails the step and touches nothing.
-10. `ionos-build-retain.sh`: keeps the newest 14 dev pre-releases (`KEEP`, default 14) and deletes older
-    ones with `gh release delete --cleanup-tag --yes`. Only published pre-releases whose tag is exactly
-    `dev-v<a>.<b>.<c>.<n>` are considered; anything else is never touched. Deletions are logged. `DRY_RUN=true`
-    only prints.
+   `build_number:`, `base_release:`, `flavors_scope:`, `flavors:`), the flavor list and a link to the run.
+   An existing release for the tag (a re-run of a finished run keeps its number) fails and touches nothing.
+5. `ionos-build-retain.sh`, a separate step: keeps the newest 14 dev pre-releases (`KEEP`, default 14) and
+   deletes older ones with `gh release delete --cleanup-tag --yes`. Only published pre-releases whose tag is
+   exactly `dev-v<a>.<b>.<c>.<n>` are considered; anything else is never touched. Deletions are logged.
+   `DRY_RUN=true` only prints.
 
 The default `GITHUB_TOKEN` is enough: the tag points at an existing commit and no workflow file is
-pushed. All third-party actions are GitHub's own and pinned to a commit SHA.
+pushed. All actions are GitHub's own and pinned to a commit SHA.
 
 ## Differences from upstream's release build
 
