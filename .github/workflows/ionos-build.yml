@@ -1,0 +1,161 @@
+# Dev build: builds the server and every needed out-of-tree app from source, assembles and validates
+# every flavor with the tool pinned by the checked-out dev branch (IONOS/tools), and publishes the
+# archives as ONE GitHub pre-release with checksums and a build-provenance attestation.
+# The logic lives in .github/ionos/ionos-build-*.sh (tested by ionos-build.test.sh); see
+# .github/ionos/ionos-build.md.
+#
+# WHY ONE FILE FOR ALL BUILDS: GitHub's run_number counts per workflow file, and the build number of
+# every artifact (dev and, with a later ticket, release) is this run number: one counter, always
+# increasing. A second workflow file for release builds would start a second counter. Kind `release`
+# is therefore an input of this file; it is rejected for now.
+#
+# NOTE: scheduled runs and manual runs only exist once this file is on the repository's DEFAULT
+# branch, which a person switches to the dev branch (a separate settings ticket). Until then nothing
+# here runs on its own.
+
+name: IONOS build
+
+on:
+  schedule:
+    - cron: '7 5 * * *'
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: 'Build kind (release builds arrive with the snapshot ticket)'
+        type: choice
+        options: [dev, release]
+        default: dev
+      flavors:
+        description: 'Comma separated flavors to build (default: every flavor of IONOS/flavors)'
+        type: string
+        default: ''
+      force:
+        description: 'Build although nothing changed since the last dev pre-release (scheduled runs skip then)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ionos-build
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Decide whether to build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      build: ${{ steps.plan.outputs.build }}
+      line: ${{ steps.plan.outputs.line }}
+      server_commit: ${{ steps.plan.outputs.server_commit }}
+      flavors_commit: ${{ steps.plan.outputs.flavors_commit }}
+    steps:
+      # The repository has about 7.6 GB of history: one commit, only the scripts. The submodule
+      # entry (the flavors commit) is read from the commit itself.
+      - name: Check out the scripts
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          fetch-depth: 1
+          sparse-checkout: .github/ionos
+          persist-credentials: false
+
+      - name: Plan
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          KIND: ${{ inputs.kind || 'dev' }}
+          FORCE: ${{ inputs.force }}
+          REF_NAME: ${{ github.ref_name }}
+        run: bash .github/ionos/ionos-build-plan.sh
+
+  build:
+    name: Build, validate and publish
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      WORK: ${{ runner.temp }}/ionos-build
+    steps:
+      - name: Check out the dev branch
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      # Only 3rdparty and the flavors repository now; every app submodule is initialised later, and
+      # only the ones the selected flavors need.
+      - name: Check out 3rdparty and the flavors repository
+        run: git submodule update --init --depth 1 -- 3rdparty IONOS
+
+      - name: Set up Node.js for the server build
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: package.json
+
+      - name: Build the server from source
+        run: bash .github/ionos/ionos-build-server.sh
+
+      - name: Set up Node.js 24 for the tooling
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+
+      - name: Install the flavors tool
+        working-directory: IONOS/tools
+        run: npm ci --ignore-scripts
+
+      - name: Resolve the flavors and select the apps
+        env:
+          FLAVORS: ${{ inputs.flavors }}
+        run: bash .github/ionos/ionos-build-select.sh
+
+      - name: Build the out-of-tree apps from source
+        run: bash .github/ionos/ionos-build-apps.sh
+
+      - name: Assemble the clean tree
+        run: bash .github/ionos/ionos-build-assemble.sh
+
+      - name: Build and validate every flavor
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+          LINE: ${{ needs.plan.outputs.line }}
+          SERVER_COMMIT: ${{ needs.plan.outputs.server_commit }}
+          FLAVORS_COMMIT: ${{ needs.plan.outputs.flavors_commit }}
+        run: bash .github/ionos/ionos-build-package.sh
+
+      - name: Attest the build provenance
+        id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/ionos-build/out/*.zip
+
+      - name: Keep the attestation next to the archives
+        env:
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: cp "$BUNDLE_PATH" "$WORK/out/ncw-build-$BUILD_NUMBER.attestation.jsonl"
+
+      - name: Publish the pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          BUILD_NUMBER: ${{ github.run_number }}
+          SERVER_COMMIT: ${{ needs.plan.outputs.server_commit }}
+          FLAVORS_COMMIT: ${{ needs.plan.outputs.flavors_commit }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: bash .github/ionos/ionos-build-publish.sh
+
+      - name: Prune old dev pre-releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: bash .github/ionos/ionos-build-retain.sh
