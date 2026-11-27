@@ -334,7 +334,7 @@ echo "${PWD#"$CMD_BASE"/}: $name $*" >> "$CMD_LOG"
 case "$name $1 $2" in
   "npm-stub ci "*) mkdir -p node_modules/dep && echo dev > node_modules/dep/index.js ;;
   "npm-stub run build") [ "${NPM_FAIL:-}" = "$(basename "$PWD")" ] && exit 1
-     [ "${NPM_NOBUILD:-}" = "$(basename "$PWD")" ] || { mkdir -p js && echo built > js/built.js; }
+     [ "${NPM_NOBUILD:-}" = "$(basename "$PWD")" ] || { mkdir -p js && echo built > "js/${NPM_OUT:-built}.js"; }
      [ "$(basename "$PWD")" = "$(basename "$CMD_BASE")" ] && { mkdir -p dist && echo built > dist/core.js; } ;;
   "composer-stub install "*) [ "${COMPOSER_NOBUILD:-}" = "$(basename "$PWD")" ] || { mkdir -p vendor/pkg/tests && echo x > vendor/pkg/tests/t.php && echo x > vendor/autoload.php; } ;;
 esac
@@ -378,6 +378,8 @@ mkapp() {
   # committed built output, which must never be trusted
   case "$kind" in both|composer) mkdir -p "$d/vendor"; echo stale > "$d/vendor/stale.php" ;; esac
   case "$kind" in both|plainjs|static) mkdir -p "$d/js"; echo stale > "$d/js/stale.js" ;; esac
+  # a handwritten source in an output dir: git tracks it, so nothing may delete it
+  case "$kind" in both) mkdir -p "$d/css"; echo hand > "$d/css/hand.css" ;; esac
   printf '/src\ntests\n.nextcloudignore\n' > "$d/.nextcloudignore"
   echo s > "$d/src/s.js"; echo t > "$d/tests/t.php"; echo l > "$d/lib/l.php"
   git -C "$d" add -A; git -C "$d" commit -q -m "app $1"; git -C "$d" tag v1.0.0
@@ -511,7 +513,10 @@ sc_apps() {
   check "default recipe: composer install --no-dev -a" grep -q 'apps-x/a: composer-stub install --no-dev -a' "$ROOT/a1/cmd.log"
   check "default recipe: npm ci then npm run build" bash -c "grep -n 'apps-x/a: npm-stub' '$ROOT/a1/cmd.log' | cut -d: -f3- | tr '\n' ';' | grep -q 'npm-stub ci.*npm-stub run build'"
   check "default recipe: built files are there" test -f "$r/apps-x/a/js/built.js" -a -f "$r/apps-x/a/vendor/autoload.php"
-  check "default recipe: committed built output is deleted before the build (vendor/ and js/)" test ! -e "$r/apps-x/a/vendor/stale.php" -a ! -e "$r/apps-x/a/js/stale.js"
+  check "default recipe: nothing that git tracks is deleted (js/, css/ and vendor/ files)" test -f "$r/apps-x/a/vendor/stale.php" -a -f "$r/apps-x/a/js/stale.js" -a "$(cat "$r/apps-x/a/css/hand.css")" = hand
+  run_build a1 ionos-build-apps.sh NPM_OUT=second
+  check "default recipe: untracked leftovers of an earlier build are removed before the next" test ! -e "$r/apps-x/a/js/built.js" -a -f "$r/apps-x/a/js/second.js"
+  check "default recipe: a second build still keeps the tracked files" test -f "$r/apps-x/a/js/stale.js" -a -f "$r/apps-x/a/css/hand.css"
   check "default recipe: npm ci runs with --ignore-scripts" grep -q 'apps-x/a: npm-stub ci --ignore-scripts' "$ROOT/a1/cmd.log"
   check "default recipe: node_modules is deleted afterwards" test ! -e "$r/apps-x/a/node_modules"
   check "a recipe in build-recipes replaces the default for that app" test -f "$r/apps-x/b/recipe-ran"
@@ -528,12 +533,12 @@ sc_apps() {
   # the rule for built files (see ionos-build.md)
   mkapp ca composer; mkapp cb both; mkapp cc plainjs; mkapp cd static; mkapp ce both
   fork a4 ca; run_build a4 ionos-build-select.sh; run_build a4 ionos-build-apps.sh
-  check "composer-only app: built from source, vendor/ comes from composer" test "$(status a4)" = 0 -a -f "$ROOT/a4/repo/apps-x/ca/vendor/autoload.php" -a ! -e "$ROOT/a4/repo/apps-x/ca/vendor/stale.php"
+  check "composer-only app: built from source, vendor/ comes from composer" test "$(status a4)" = 0 -a -f "$ROOT/a4/repo/apps-x/ca/vendor/autoload.php"
   check "composer-only app: no npm call" test "$(grep -c 'apps-x/ca: npm' "$ROOT/a4/cmd.log")" = 0
   fork a5 ca; run_build a5 ionos-build-select.sh; run_build a5 ionos-build-apps.sh COMPOSER_NOBUILD=ca
   check "an app with a composer.json whose build produced no vendor/ fails and is named" test "$(status a5)" != 0 -a -n "$(grep '::error::.*ca' "$ROOT/a5/out.log")"
   fork a6 cb; run_build a6 ionos-build-select.sh; run_build a6 ionos-build-apps.sh NPM_NOBUILD=cb
-  check "an app with a build script that produced no js/ or css/ fails and is named" test "$(status a6)" != 0 -a -n "$(grep '::error::.*cb' "$ROOT/a6/out.log")"
+  check "an app with a build script that wrote no new file in js/ or css/ fails and is named (tracked files do not count)" test "$(status a6)" != 0 -a -n "$(grep '::error::.*cb' "$ROOT/a6/out.log")"
   fork a7 cc; run_build a7 ionos-build-select.sh; run_build a7 ionos-build-apps.sh
   check "committed js/ without a build script and without a recipe fails and is named" test "$(status a7)" != 0 -a -n "$(grep '::error::.*cc' "$ROOT/a7/out.log")"
   check "that failure happens before anything is deleted or built" test ! -e "$ROOT/a7/cmd.log" -o "$(grep -c 'apps-x/cc' "$ROOT/a7/cmd.log" 2>/dev/null)" = 0
@@ -547,6 +552,14 @@ sc_apps() {
   mkdir -p "$ROOT/a10/repo/.github/ionos/build-recipes"; printf '#!/usr/bin/env bash\ntrue\n' > "$ROOT/a10/repo/.github/ionos/build-recipes/cf.sh"
   run_build a10 ionos-build-select.sh; run_build a10 ionos-build-apps.sh
   check "an app with committed js/ and no build script is fine with a recipe" test "$(status a10)" = 0
+
+  # every app is tried; ONE error lists all failing apps
+  mkapp cg both
+  fork a11 ca cb cg; run_build a11 ionos-build-select.sh; run_build a11 ionos-build-apps.sh COMPOSER_NOBUILD=ca NPM_NOBUILD=cb
+  check "a failing app does not stop the others: the last app is built" test -f "$ROOT/a11/repo/apps-x/cg/js/built.js"
+  check "the step fails" test "$(status a11)" != 0
+  check "exactly one ::error:: line" test "$(grep -c '::error::' "$ROOT/a11/out.log")" = 1
+  check "that line lists every failing app and not the good one" bash -c "grep '::error::' '$ROOT/a11/out.log' | grep -q 'ca' && grep '::error::' '$ROOT/a11/out.log' | grep -q 'cb' && ! grep '::error::' '$ROOT/a11/out.log' | grep -q 'cg'"
 
   fork a3
   run_build a3 ionos-build-select.sh

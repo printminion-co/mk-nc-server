@@ -21,37 +21,45 @@ RECIPES_DIR=${RECIPES_DIR:-$ROOT/.github/ionos/build-recipes}
 read -r -a NPM_CMD <<<"${NPM:-npm}"
 read -r -a COMPOSER_CMD <<<"${COMPOSER:-composer}"
 
-# The default recipe, run in the app folder (APP is set). Built files are never trusted:
+# The default recipe, run in the app folder (APP is set). Built output is never trusted, and nothing that git
+# tracks is ever deleted (js/ and css/ can hold handwritten sources):
 #  - an app with committed js/ or css/ files, no package.json build script and no recipe is an error: it
 #    cannot be rebuilt from source here (add .github/ionos/build-recipes/<app>.sh, even a no-op one that
 #    says the files are sources);
-#  - composer.json: vendor/ is deleted, `composer install --no-dev -a` must produce vendor/autoload.php;
-#  - a package.json build script: js/ and css/ are deleted, `npm ci --ignore-scripts && npm run build` must
-#    produce files in js/ or css/;
+#  - composer.json: untracked and ignored files of vendor/ are removed, `composer install --no-dev -a` runs
+#    and vendor/autoload.php must exist;
+#  - a package.json build script: untracked and ignored files of js/ and css/ are removed, a marker is
+#    taken, `npm ci --ignore-scripts && npm run build` runs, and the build must have written at least one
+#    file newer than the marker in js/ or css/ (so a build that writes nothing fails);
 #  - node_modules is deleted afterwards.
 # Every command ends in `|| return 1`: this runs under `||` in the caller, where `set -e` does nothing.
+# Messages are plain lines naming the app; the one ::error:: of the step lists all failing apps.
 default_recipe() {
-  local has_composer=false has_build=false
+  local has_composer=false has_build=false marker
   [ -f composer.json ] && has_composer=true
   if [ -f package.json ] && jq -e '.scripts.build' package.json >/dev/null; then has_build=true; fi
 
   if [ "$has_build" = false ] && [ -n "$(git ls-files -- js css | head -n1)" ]; then
-    echo "::error::ionos-build: $APP has committed js/ or css/ files but no package.json build script and no recipe in .github/ionos/build-recipes/$APP.sh: it cannot be built from source" >&2
+    echo "ionos-build: $APP has committed js/ or css/ files but no package.json build script and no recipe in .github/ionos/build-recipes/$APP.sh: it cannot be built from source" >&2
     return 1
   fi
   if [ "$has_composer" = true ]; then
-    rm -rf vendor
+    git clean -fdxq -- vendor || return 1
     "${COMPOSER_CMD[@]}" install --no-dev -a --no-interaction --quiet || return 1
-    [ -f vendor/autoload.php ] || { echo "::error::ionos-build: $APP has a composer.json but composer install produced no vendor/autoload.php" >&2; return 1; }
+    [ -f vendor/autoload.php ] || { echo "ionos-build: $APP has a composer.json but composer install produced no vendor/autoload.php" >&2; return 1; }
   fi
   if [ "$has_build" = true ]; then
-    rm -rf js css
+    git clean -fdxq -- js css || return 1
     "${NPM_CMD[@]}" ci --ignore-scripts || return 1
-    "${NPM_CMD[@]}" run build || return 1
-    if [ -z "$(find js css -type f -print -quit 2>/dev/null)" ]; then
-      echo "::error::ionos-build: $APP has a build script but the build produced no files in js/ or css/ (add a recipe if it builds elsewhere)" >&2
+    marker=$(mktemp) || return 1
+    sleep 1
+    "${NPM_CMD[@]}" run build || { rm -f "$marker"; return 1; }
+    if [ -z "$(find js css -type f -newer "$marker" -print -quit 2>/dev/null)" ]; then
+      rm -f "$marker"
+      echo "ionos-build: $APP has a build script but the build wrote no new file in js/ or css/ (add a recipe if it builds elsewhere)" >&2
       return 1
     fi
+    rm -f "$marker"
   fi
   rm -rf node_modules
 }
@@ -75,8 +83,13 @@ build_app() { # build_app <path>
   fi
 }
 
+failed=()
 while read -r path; do
   [ -n "$path" ] || continue
-  build_app "$path" || die "the build of app $(basename "$path") ($path) failed"
+  if ! build_app "$path"; then
+    echo "ionos-build: the build of app $(basename "$path") ($path) failed" >&2
+    failed+=("$(basename "$path")")
+  fi
 done < "$WORK/apps-all.txt"
+[ ${#failed[@]} -eq 0 ] || die "these apps failed to build: ${failed[*]}"
 log "apps built: $(wc -l < "$WORK/apps-all.txt")"
