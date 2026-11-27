@@ -4,6 +4,10 @@
 #
 # Environment:
 #   GH_TOKEN, GITHUB_REPOSITORY   required (owner/name of this fork)
+#   READ_TOKEN       token for reading public upstream data (nextcloud/*, nextcloud-releases/*), default
+#                    GH_TOKEN. The workflow passes the default GITHUB_TOKEN: the nextcloud organization
+#                    rejects fine-grained personal access tokens with a lifetime over 366 days, which the
+#                    sync token may have. Only operations on the fork use GH_TOKEN.
 #   HAS_SYNC_TOKEN   "true" when GH_TOKEN is the repository secret IONOS_SYNC_TOKEN. Pull requests
 #                    opened with the default GITHUB_TOKEN do not trigger workflows (no commit lint)
 #   LINE             release line, default 33
@@ -26,6 +30,17 @@ HAS_SYNC_TOKEN=${HAS_SYNC_TOKEN:-false}
 RELEASES_REPO=nextcloud-releases/server
 UPSTREAM_SERVER=nextcloud/server
 UPSTREAM_ORG=nextcloud
+READ_TOKEN=${READ_TOKEN:-${GH_TOKEN:-}}
+ERRFILE=$(mktemp)
+trap 'rm -f "$ERRFILE"' EXIT
+
+# upstream_api <gh api arguments>: the one way to read public upstream data (nextcloud/*, nextcloud-releases/*),
+# with the read token. gh's error text goes to $ERRFILE (see api_error), not to the log.
+upstream_api() { GH_TOKEN="$READ_TOKEN" gh api "$@" 2>"$ERRFILE"; }
+# fork_api <gh api arguments>: a read of this fork with the sync token, same error handling.
+fork_api() { gh api "$@" 2>"$ERRFILE"; }
+# gh's last error message, on one line
+api_error() { tr '\n' ' ' <"$ERRFILE" | sed 's/ *$//'; }
 
 [[ $LINE =~ ^[0-9]+$ ]] || die "LINE '$LINE' is not a number"
 [[ $BASE_BRANCH =~ ^[A-Za-z0-9._/-]+$ && $BASE_BRANCH != *..* ]] || die "BASE_BRANCH '$BASE_BRANCH' contains characters that are not allowed in a branch name here"
@@ -44,10 +59,12 @@ pins_in_root_tree() {
 # line (from upstream's server repository) that is an ancestor of the dev branch tip. Done through
 # the API: the tag's commit is compared with the tip, status ahead or identical means ancestor.
 base_release_of_dev_branch() {
-  local tips name type sha status t
+  local tips name type sha status t obj cmp
   local -A TYPE SHA
-  tips=$(gh_paginate '.[] | [(.ref | ltrimstr("refs/tags/")), .object.type, .object.sha] | @tsv' \
-    -X GET "repos/$UPSTREAM_SERVER/git/matching-refs/tags/v$LINE." -f per_page=100)
+  tips=$(upstream_api --paginate -X GET "repos/$UPSTREAM_SERVER/git/matching-refs/tags/v$LINE." -f per_page=100) ||
+    die "cannot list the tags of $UPSTREAM_SERVER: $(api_error)"
+  tips=$(jq -r '.[] | [(.ref | ltrimstr("refs/tags/")), .object.type, .object.sha] | @tsv' <<<"$tips") ||
+    die "cannot read the tag list of $UPSTREAM_SERVER"
   while IFS=$'\t' read -r name type sha; do
     [ -n "$name" ] || continue
     TYPE[$name]=$type; SHA[$name]=$sha
@@ -56,11 +73,13 @@ base_release_of_dev_branch() {
     [ -n "$t" ] || continue
     sha=${SHA[$t]}
     if [ "${TYPE[$t]}" = tag ]; then   # annotated tag: dereference to the commit
-      sha=$(gh api "repos/$UPSTREAM_SERVER/git/tags/$sha" | jq -r 'select(.object.type == "commit") | .object.sha')
+      obj=$(upstream_api "repos/$UPSTREAM_SERVER/git/tags/$sha") || die "cannot read the tag object of $t in $UPSTREAM_SERVER: $(api_error)"
+      sha=$(jq -r 'select(.object.type == "commit") | .object.sha' <<<"$obj")
     fi
     [[ $sha =~ ^[0-9a-f]{40}$ ]] || die "tag $t of $UPSTREAM_SERVER does not point at a commit"
-    status=$(gh api -X GET "repos/$REPO/compare/$sha...$BASE_SHA" -f per_page=1 | jq -r .status) ||
-      die "cannot compare $t with $BASE_BRANCH"
+    cmp=$(fork_api -X GET "repos/$REPO/compare/$sha...$BASE_SHA" -f per_page=1) ||
+      die "cannot compare $t with $BASE_BRANCH: $(api_error)"
+    status=$(jq -r .status <<<"$cmp") || die "cannot compare $t with $BASE_BRANCH: unexpected answer"
     case "$status" in
       ahead | identical) echo "$t"; return 0 ;;
     esac
@@ -81,7 +100,8 @@ TAG=$BASE_RELEASE
 log "release tag $TAG (base of $BASE_BRANCH)"
 
 # 2. Upstream's app list; apps that live in the fork's apps/ need no pin
-CONFIG=$(gh api -H 'Accept: application/vnd.github.raw+json' "repos/$RELEASES_REPO/contents/stable$LINE.json")
+CONFIG=$(upstream_api -H 'Accept: application/vnd.github.raw+json' "repos/$RELEASES_REPO/contents/stable$LINE.json") ||
+  die "cannot read the app list stable$LINE.json of $RELEASES_REPO: $(api_error)"
 ROOT=$(gh api "repos/$REPO/git/trees/$ROOT_TREE")
 APPS_TREE=$(jq -r '.tree[] | select(.path == "apps") | .sha' <<<"$ROOT")
 IN_TREE=$(gh api "repos/$REPO/git/trees/$APPS_TREE" | jq -r '.tree[] | select(.type == "tree") | .path')
@@ -98,8 +118,11 @@ while IFS=$'\t' read -r id repo; do
   esac
   [[ $repo =~ ^nextcloud/[A-Za-z0-9._-]+$ && $repo != */. && $repo != */.. ]] ||
     die "invalid repository $(printf '%q' "$repo") for app $id in upstream's app list"
-  if ! ref=$(gh api "repos/$repo/git/ref/tags/$TAG" 2>&1); then
-    die "tag $TAG not found in $repo (app $id): upstream does not tag every listed app for this release"
+  if ! ref=$(upstream_api "repos/$repo/git/ref/tags/$TAG"); then
+    if grep -q 'HTTP 404' "$ERRFILE"; then
+      die "tag $TAG not found in $repo (app $id): upstream does not tag every listed app for this release"
+    fi
+    die "cannot read tag $TAG of $repo (app $id): $(api_error)"
   fi
   sha=$(jq -r 'select(.object.type == "commit") | .object.sha' <<<"$ref")
   [[ $sha =~ ^[0-9a-f]{40}$ ]] || die "tag $TAG of $repo (app $id) does not point at a commit"
