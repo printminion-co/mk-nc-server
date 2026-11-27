@@ -615,6 +615,20 @@ sc_assemble() {
   run_build m2 ionos-build-assemble.sh
   check "a symbolic link left in the tree fails the step and is named" test "$(status m2)" != 0 -a -n "$(grep 'odd-link' "$ROOT/m2/out.log")"
 
+  fork m4
+  echo 'license text' > "$ROOT/m4/repo/lib/LICENSES.txt"
+  ln -s LICENSES.txt "$ROOT/m4/repo/lib/a.js.license"
+  run_build m4 ionos-build-select.sh
+  run_build m4 ionos-build-assemble.sh
+  check "a symbolic link to a file inside the tree is replaced by a copy of the file" test "$(status m4)" = 0 -a ! -L "$ROOT/m4/work/tree/lib/a.js.license" -a "$(cat "$ROOT/m4/work/tree/lib/a.js.license")" = "license text"
+
+  fork m5
+  echo 'secret' > "$ROOT/m5/outside.txt"
+  ln -s "$ROOT/m5/outside.txt" "$ROOT/m5/repo/lib/out-link"
+  run_build m5 ionos-build-select.sh
+  run_build m5 ionos-build-assemble.sh
+  check "a symbolic link to a file outside the tree is not copied but fails the step and is named" test "$(status m5)" != 0 -a -n "$(grep 'out-link' "$ROOT/m5/out.log")"
+
   fork m3
   rm -rf "$ROOT/m3/repo/3rdparty"; mkdir "$ROOT/m3/repo/3rdparty"
   run_build m3 ionos-build-select.sh

@@ -66,8 +66,9 @@ no cancelling) runs everything that executes app code and ends by uploading the 
    `node_modules`, `IONOS`; `3rdparty` without `.git .github .gitignore README.md`; remove what the root
    `.nextcloudignore` lists (`git ls-files -cio --exclude-from`, gitignore semantics) and what each built
    app's own `.nextcloudignore` lists (keeping `composer.json/lock`, `package.json/-lock.json`); drop
-   `*.map.license`; remove `config/config.php`, `data/` and empty folders. A symbolic link left in the tree
-   fails the step (the official archive has none).
+   `*.map.license`; remove `config/config.php`, `data/` and empty folders. A symbolic link to a regular file
+   inside the tree (for example the `*.js.license` links of built apps) is replaced by a copy of the file, as zip does
+   for the official archive; any other symbolic link (broken, to a folder, or pointing outside the tree) fails the step.
 7. `ionos-build-package.sh`: per flavor, a pins file `{app: {commit, describe}}` for the flavor's built
    submodule apps (`git submodule status` must show the pinned commit; `describe` is `git describe --tags
    --always` after a blobless unshallow fetch), then `ncw build --kind dev --build-number <run number>
