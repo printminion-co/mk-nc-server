@@ -69,6 +69,13 @@ Create the token as a fine-grained personal access token limited to this reposit
 write access to Contents, Workflows, Pull requests, Issues and Actions, and store it under Settings,
 Secrets and variables, Actions as `IONOS_SYNC_TOKEN`.
 
+The token's lifetime does not matter for reading upstream: the `nextcloud` organization rejects
+fine-grained tokens with a lifetime over 366 days (HTTP 403), so nothing sends this token to
+`nextcloud/*` or `nextcloud-releases/*`. `ionos-sync.sh` calls no upstream API at all and fetches upstream's
+public repository over git without credentials (the credential header is scoped to the fork's URL only);
+its real runs worked for that reason. `ionos-app-pins.sh` reads upstream through the API with the default
+token (see `ionos-app-pins.md`). Give the sync token a short expiry anyway and rotate it.
+
 Pushes made with this token DO trigger workflows (pushes with the default token do not). The pins
 pull request opened by `ionos-app-pins.yml` uses the same token so that the commit-lint workflow runs
 on it.
