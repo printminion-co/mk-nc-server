@@ -16,7 +16,7 @@ accepted only on a snapshot branch, see "Release builds". All flavors of a run s
 still uses a number, so numbers can have gaps; they always increase.
 
 Triggers: `schedule` (05:07 UTC daily) and `workflow_dispatch` with inputs `kind` (default `dev`),
-`flavors` (comma separated, default every folder of `IONOS/flavors`), `force`, `no_cache` (see "Cache" below) and `smoke_break` (see the smoke test below). Scheduled and manual
+`flavors` (comma separated, default every folder of `IONOS/flavors`), `force`, `no_cache` (see "Cache" below) and `smoke_break` (see the smoke tests below). Scheduled and manual
 runs only exist once the file is on the default branch; a person switches that to the dev branch (a
 separate settings ticket). A dev run must be on `ionos-dev-v<nn>`: the line is derived from the branch name.
 
@@ -83,7 +83,12 @@ no cancelling) runs everything that executes app code and ends by uploading the 
 
 **`smoke`** (needs `plan` and `build`; permissions `contents: read` only): see "Fresh-install smoke test" below.
 
-**`publish`** (needs `plan`, `build` and `smoke`; permissions `contents: write`, `id-token: write`,
+**`upgrade-smoke-sqlite`** (every build) and **`upgrade-smoke-mariadb`** (release builds only; needs `plan` and `build`; permissions
+`contents: read` only): see "Upgrade smoke test" below.
+
+**`gate`** (needs every test job, `if: always()`, `contents: read`): `ionos-build-gate.sh`, see "The gate in front of publish".
+
+**`publish`** (needs `plan`, `build` and `gate`; permissions `contents: write`, `id-token: write`,
 `attestations: write`; runs no npm, no composer and no app code: it checks out only `.github/ionos`):
 
 1. Download the artifact (`actions/download-artifact`).
@@ -234,6 +239,106 @@ A manual run of `IONOS build` with input `smoke_break` set to one of these tampe
 If the smoke test passes with a break, the run fails with "did not catch the break" (so a gate that proves nothing is a
 failure too). Scheduled runs have no such input and always use `none`; the tamper step also only runs for `workflow_dispatch`.
 Combine with `flavors` to keep the proof short. A run with a break must show: smoke failed, publish skipped, no release.
+
+## Upgrade smoke test
+
+Jobs `upgrade-smoke-sqlite` and `upgrade-smoke-mariadb` (after `build`, parallel to the fresh-install `smoke`) test the migration path of
+07-validation.md, "Upgrade from": the vanilla OFFICIAL archive of the base release, upgraded to every flavor archive the way
+05-deployment.md, "Upgrading to a new artifact", says. The base release comes from the `base-release` file of the build artifact (the
+tag annotation for release builds, the built tree for dev builds). Not in scope yet: upgrading from the flavor's own previous release
+(none exists before `ncw-v33-1`); it is a later extension: a second starting archive in `ionos-smoke-upgrade.sh`, the same contract steps.
+
+Scripts: `ionos-smoke-vanilla.sh` (download and verify), `ionos-smoke-upgrade.sh` (the run), `ionos-smoke-lib.sh` (what the fresh-install and the
+upgrade run share: serving the tree, probes, `cron.php`, `files:scan`, app-state comparison, log check, so there is ONE implementation of each;
+`ionos-smoke-run.sh` was refactored onto it and its tests are unchanged). Tests: `ionos-smoke.test.sh` (scenarios `upgrade`, `vanilla`, `gate` ...).
+
+### The vanilla archive and its trust model
+
+`https://download.nextcloud.com/server/releases/nextcloud-<base>.zip`, into a fresh folder. Two checks, with different strength:
+
+- the SHA-256 from the `.sha256` file of the SAME host only catches a corrupt or truncated download; a tampered host would serve a matching file.
+  (The published file also lists the `.metadata` file, so the zip's line is picked by name.)
+- the `.asc` signature IS checked, because it is feasible and small: `gpg` is on the runner, the Nextcloud release key
+  (`ionos-nextcloud-release-key.asc`, Nextcloud Security <security@nextcloud.com>, fingerprint `2880 6A87 8AE4 23A2 8372 792E D758 99B9 A724 937A`, the
+  one on nextcloud.com/nextcloud.asc) is COMMITTED here and its fingerprint pinned in the script, imported into a throw-away `GNUPGHOME`; the
+  signature must verify and its primary key must be the pinned one. Key and fingerprint do not come from the download host, so this is the check
+  that proves the archive. Changing the key is a reviewed commit. Verified on 33.0.9 (signature made 2026-09-10).
+
+### The contract steps, per flavor archive (`ionos-smoke-upgrade.sh`)
+
+1. The vanilla zip is unpacked into a fresh folder and installed with `occ maintenance:install` (`--data-dir` OUTSIDE the code tree, SQLite or MariaDB);
+   `occ app:list` and the version are kept as the state before.
+2. The flavor archive is unpacked into its own fresh folder; its `removed-apps.json` is read. Every listed app that is enabled on the old version is
+   disabled there with `occ app:disable`; one the old version does not have is skipped (idempotent). Ids must be plain (`[a-z0-9_]`).
+3. Swap: the old code tree is replaced by the unpacked archive. Only `config/config.php` is copied over (the state Nextcloud writes itself, which the
+   deployment persists); data folder and database stay where they are. An archive that ships its own `config/config.php` fails.
+4. `occ upgrade`. The version afterwards must be the old one plus the archive's build number (`33.0.9.1` -> `33.0.9.1.12`), else "the upgrade did not take".
+5. `bash ncw-configure.sh` with the declared variables set as in the fresh run.
+6. The shared checks: probes, `cron.php`, `files:scan --all`, app states against the resolved flavor and the log check with the SAME allow-list file.
+
+App states after an upgrade follow the contract ("on existing instances only `always` and `removed` change state"): an app of the old version keeps
+its state (`default`/`available` do not apply), `always` must be enabled, `removed` absent, `enable_after_install` apps enabled, an app that is new
+on the instance is judged like on a fresh install, and an app the flavor does not list is an error (`ionos-smoke-apps.sh` with the old app list as third argument).
+
+### Findings of the real run (flavor1 `dev-v33.0.9.12` upgraded from the official 33.0.9)
+
+- `occ app:disable workflowengine` fails on the old version with "workflowengine can't be disabled." (exit 2): it is always enabled in the vanilla
+  tree. The spec's step 1 therefore cannot be followed for always-enabled core apps. The script notes it, leaves the app to `occ upgrade` (which takes
+  an app that is in none of the shipped lists out) and goes on; any other failure of `app:disable` fails the run. `occ upgrade` then logs
+  `Disabled incompatible app: workflowengine` at info level. That line normally fails every log check; here it is accepted for EXACTLY the apps
+  that `app:disable` refused (`ionos-smoke-logs.sh` third argument), with the updater's exact wording. A deployment must tolerate that exit code too.
+- `occ upgrade` logs one error, `No application directories are marked as writable.`, because every flavor sets `writable => false` in `apps_paths`. By
+  design, so it is on the allow-list with a comment (`ionos-smoke-log-allowlist.txt`).
+- After the upgrade `cron.php` logs warnings (level 2, not a failure) `failed to create instance of background job` for jobs of the removed apps
+  `support`, `workflowengine` and `firstrunwizard`: the background jobs stay registered in the database after the apps are gone. Harmless noise on every
+  cron run, but real; a flavors-tool or spec follow-up (not done here).
+
+### Databases
+
+- SQLite for every build (dev and release).
+- MariaDB for release builds (`kind == release`), as a job `services:` container. The image is set in ONE place, the `image:` line of the job
+  `upgrade-smoke-mariadb` in `ionos-build.yml`: `mariadb:10.11.19@sha256:e5fe75b2...` (pinned by digest, a multi-arch index). It can be overridden without a commit by
+  the repository variable `IONOS_MARIADB_IMAGE`. Why 10.11: the Nextcloud admin manual lists MariaDB 10.11 / 11.4 / 11.8 / 12.3, and 10.11 is the oldest
+  long-term-support line, so it tests the lower end. The version the user runs in production is NOT known; set the variable (or the line) to it as soon as it is.
+- The container cannot take server arguments, so the script sets `transaction_isolation = READ-COMMITTED` and `binlog_format = ROW` globally with the root account
+  (what Nextcloud requires), then creates a fresh database `ncw_<flavor>` per flavor and grants the test user on it. The credentials are test values, only on the job's container.
+- Needs `pdo_mysql` in PHP; the script checks the extensions first. UNVERIFIED locally: this machine has no `pdo_mysql` and no MariaDB, only CI can run it.
+
+### Logs and timings
+
+Artifacts `ionos-upgrade-smoke-logs-sqlite` and `-mariadb` (14 days, `if: always()`): per flavor `resolved.yaml`, `install.log`, `disable.log`,
+`disable-refused.txt`, `upgrade.log`, `configure.log`, `app-list-before.json`, `app-list.json`, `apps.log`, `probes/`, `nextcloud.log`, `logs.log` and
+`timings.txt` (seconds per phase). Local measurement (flavor1, this machine, which was busy with other work): vanilla download 41 s (270 MB), unzip 4-10 s,
+vanilla install 13-47 s, `occ upgrade` 1-4 s, `ncw-configure.sh` 1-3 s, the checks about 30 s; 1 to 4 minutes per flavor in total. Job timeout: 90 minutes
+(generous; a MariaDB install is slower than SQLite).
+
+### The gate in front of publish
+
+`publish` used to need `smoke`. With a test job that is skipped on dev builds a plain `needs` would skip `publish` too (a skipped need skips the job), and an
+`if: always()` on `publish` would publish after a failure. So `publish` needs `plan`, `build` and `gate`; `gate` runs always and `ionos-build-gate.sh`
+decides from the results: build, fresh-install smoke and SQLite upgrade must be `success`; the MariaDB upgrade must be `success` for a release build and may be
+`skipped` only for a dev build; `failure`, `cancelled`, an unknown or a missing result blocks always; when the plan says nothing is built every later job must be
+`skipped` and the gate passes (publish then skips because `build` was skipped). The script is tested with every combination, and `ionos-smoke.test.sh` reads the
+YAML: publish needs the gate, the gate needs every other job (a new job must be added), `if: always()`, the MariaDB job only for releases. The real
+behavior of `needs` on GitHub can only be seen in a run (see below).
+
+### Only a real GitHub run can show
+
+The MariaDB service container (health check, `job.services.mariadb.ports`, the PDO setup against the real server), the `needs`/`always()` behavior
+of `gate` and `publish`, the runner's PHP extensions (`pdo_mysql`), the runner's disk and time with a 3 GB tree per flavor, and the artifacts.
+
+### Proving the upgrade gate (`smoke_break`)
+
+The same input as for the fresh-install test; each mode belongs to exactly one smoke test and is ignored by the other (`SMOKE_BREAK_JOB` in
+`ionos-smoke-break.sh`), so exactly the test it names must fail and `publish` must be skipped:
+
+| Value | What it does | Seen on the real artifact |
+| --- | --- | --- |
+| `removed-in-shipped` | puts the first app of `removed-apps.json` back into all three lists of `core/shipped.json` while its folder stays out of the tree: a flavor that forgot to remove an app | `occ upgrade` fails (exit 5): `The files of the app "firstrunwizard" were not correctly replaced before running the update` |
+| `no-buildnumber` | deletes `.buildnumber`, so the new tree has the old version and the upgrade has nothing to do | `after the upgrade the version is '33.0.9.1', expected '33.0.9.1.12' ... the upgrade did not take` |
+
+The fresh-install modes (`missing-app`, `extra-app`, `wrong-mode`, `skip-enable`) only break the fresh-install job. If an upgrade test passes with a break the
+run fails with "did not catch the break".
 
 ### What the first runs on dev-v33.0.9.5 showed
 
