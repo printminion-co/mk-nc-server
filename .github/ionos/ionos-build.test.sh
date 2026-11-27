@@ -1400,6 +1400,7 @@ sc_cache_check() {
   check "weekly: a known-nondeterministic app that differs is reported as known and is no mismatch" bash -c "grep -q '^mismatch: a\$' '$ROOT/w1/report.md' && grep -q '^known to differ: d' '$ROOT/w1/report.md' && grep -q 'known: the stub for d' '$ROOT/w1/report.md'"
   cc_run w1 WORK="$ROOT/w1/cwork" NPM_OUT=other KNOWN_FILE="$ROOT/w1/known.txt"
   check "weekly: the real known file lists calendar with its reason" bash -c "grep -q '^calendar ' '$HERE/ionos-cache-check-known.txt'"
+  check "weekly: the real known file lists text with its reason, and no app that is reproducible" bash -c "grep -q '^text .\+' '$HERE/ionos-cache-check-known.txt' && ! grep -q '^app_api ' '$HERE/ionos-cache-check-known.txt'"
   printf 'a x\nd y\n' > "$ROOT/w1/known.txt"
   cc_run w1 WORK="$ROOT/w1/cwork" NPM_OUT=other KNOWN_FILE="$ROOT/w1/known.txt"
   check "weekly: when every difference is known there is no mismatch and no issue is asked for" test "$(output w1 mismatch)" = false -a "$(status w1)" = 0

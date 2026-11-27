@@ -4,3 +4,4 @@
 # lines starting with # are ignored. Add an app only after measuring two clean builds and finding the cause, and
 # put the finding in ionos-build.md ("Reproducibility of the app builds").
 calendar webpack/terser name mangling is not stable: two chunks (js/calendar-contacts-menu.js, js/calendar-reference.js) get other identifier names in other builds (measured: five builds, five different checksums)
+text vite/rollup content-hashed chunk names change between builds on the runner (measured in the weekly run: 39 files differ, e.g. js/Editor-DJgbMEjd.chunk.mjs against js/Editor-BdXZ3brt.chunk.mjs, css chunks swap the parent name) and other files reference the hashed names, so no ignore pattern can normalize it
