@@ -190,8 +190,10 @@ publish_candidate() {
 
 make_candidate() {
   local work tag base tip cand
+  # A step runs in a subshell, so this EXIT trap fires when the step ends, also when it dies.
   work="$(mktemp -d)"
-  trap 'rm -rf "$work"' RETURN
+  CANDIDATE_WORK="$work"
+  trap 'rm -rf "$CANDIDATE_WORK"' EXIT
   candidate_setup "$work"
   tip="refs/remotes/fork/${DEV_BRANCH}"
 

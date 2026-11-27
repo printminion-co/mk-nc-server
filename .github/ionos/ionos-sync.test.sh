@@ -135,7 +135,8 @@ STUB
 # run_sync <world> [VAR=value ...]  -> runs the script, output in $W/out.log, status in $W/status
 run_sync() {
   local w="$ROOT/$1"; shift
-  env PATH="$w/bin:$PATH" STUB_STATE="$w/state" STUB_UP="$w/upstream.git" STUB_FORK="$w/fork.git" \
+  mkdir -p "$w/tmp"
+  env TMPDIR="$w/tmp" PATH="$w/bin:$PATH" STUB_STATE="$w/state" STUB_UP="$w/upstream.git" STUB_FORK="$w/fork.git" \
     GITHUB_REPOSITORY=acme/server \
     UPSTREAM_URL="$w/upstream.git" FORK_URL="$w/fork.git" "$@" \
     bash "$SYNC" > "$w/out.log" 2>&1
@@ -345,7 +346,19 @@ sc_issue_body_fence() {
   check "the manual rebase instructions survive" grep -q 'git rebase --onto v33.0.10 v33.0.9' <<<"$inside"
 }
 
-ALL="clean conflict idempotent_clean idempotent_conflict disable_workflows dry_run prerelease_ignored tag_override mirrors token issue_all_states isolation dynamic_workflows issue_body_fence"
+sc_no_temp_leak() {
+  world leak conflict final
+  run_sync leak
+  check "a run that ends with an issue leaves no temporary directory" test -z "$(ls -A "$ROOT/leak/tmp")"
+  world leak2 clean final
+  run_sync leak2 UPSTREAM_TAG=v33.0.99
+  check "a run that dies leaves no temporary directory" test "$(cat "$ROOT/leak2/status")" != 0 -a -z "$(ls -A "$ROOT/leak2/tmp")"
+  world leak3 clean final
+  run_sync leak3
+  check "a clean run leaves no temporary directory" test -z "$(ls -A "$ROOT/leak3/tmp")"
+}
+
+ALL="clean conflict idempotent_clean idempotent_conflict disable_workflows dry_run prerelease_ignored tag_override mirrors token issue_all_states isolation dynamic_workflows issue_body_fence no_temp_leak"
 if [ $# -gt 0 ]; then SELECT=("$@"); else read -r -a SELECT <<< "$ALL"; fi
 for s in "${SELECT[@]}"; do
   echo "scenario: $s"
