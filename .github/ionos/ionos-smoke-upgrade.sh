@@ -146,7 +146,20 @@ upgrade_one() {
   local install_args=(maintenance:install --admin-user "$ADMIN_USER" --admin-pass "$ADMIN_PASS" --data-dir "$work/data" --no-interaction)
   if [ "$DB" = mariadb ]; then
     dbname="ncw_${flavor//-/_}"
-    if ! { sql "SET GLOBAL transaction_isolation = 'READ-COMMITTED'" && sql "SET GLOBAL binlog_format = 'ROW'" \
+    # READ-COMMITTED is required (admin manual, system requirements). The variable is called tx_isolation up to MariaDB 11.0 and
+    # transaction_isolation from 11.1 (the old name stays an alias on some versions, not on all), so the new name is tried first
+    # and only error 1193 (unknown system variable) falls back to the old one; any other error fails with the server's message.
+    # A binary log is off in the official image (log_bin=0), and Nextcloud only asks for BINLOG_FORMAT=ROW when it is on
+    # ("disabled or BINLOG_FORMAT=ROW"), so that statement is best effort and never fails the run.
+    set_isolation() {
+      local out
+      if out=$(sql "SET GLOBAL transaction_isolation = 'READ-COMMITTED'" 2>&1); then return 0; fi
+      case "$out" in
+        *1193*) sql "SET GLOBAL tx_isolation = 'READ-COMMITTED'" ;;
+        *) echo "$out" >&2; return 1 ;;
+      esac
+    }
+    if ! { set_isolation && { sql "SET GLOBAL binlog_format = 'ROW'" || echo "binlog_format could not be set (no binary log in use): continuing"; } \
         && sql "DROP DATABASE IF EXISTS \`$dbname\`" && sql "CREATE DATABASE \`$dbname\` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci" \
         && sql "GRANT ALL PRIVILEGES ON \`$dbname\`.* TO '$DB_USER'@'%'"; } > "$dir/database.log" 2>&1; then
       cat "$dir/database.log" >&2; bad "could not prepare the MariaDB database $dbname"; finish; return

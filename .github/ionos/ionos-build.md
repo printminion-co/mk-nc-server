@@ -300,9 +300,15 @@ on the instance is judged like on a fresh install, and an app the flavor does no
   `upgrade-smoke-mariadb` in `ionos-build.yml`: `mariadb:10.11.19@sha256:e5fe75b2...` (pinned by digest, a multi-arch index). It can be overridden without a commit by
   the repository variable `IONOS_MARIADB_IMAGE`. Why 10.11: the Nextcloud admin manual lists MariaDB 10.11 / 11.4 / 11.8 / 12.3, and 10.11 is the oldest
   long-term-support line, so it tests the lower end. The version the user runs in production is NOT known; set the variable (or the line) to it as soon as it is.
-- The container cannot take server arguments, so the script sets `transaction_isolation = READ-COMMITTED` and `binlog_format = ROW` globally with the root account
-  (what Nextcloud requires), then creates a fresh database `ncw_<flavor>` per flavor and grants the test user on it. The credentials are test values, only on the job's container.
-- Needs `pdo_mysql` in PHP; the script checks the extensions first. UNVERIFIED locally: this machine has no `pdo_mysql` and no MariaDB, only CI can run it.
+- The container cannot take server arguments, so the script sets READ-COMMITTED globally with the root account (required by the admin manual): `transaction_isolation`
+  first, and on error 1193 (unknown system variable) `tx_isolation`, because MariaDB 10.x only knows the old name and 11.1+ the new one; any other error fails with the
+  server's message. Verified against the real images locally (docker): 10.11.19 rejects `transaction_isolation` and accepts `tx_isolation`; 11.8 accepts both.
+  `binlog_format = ROW` is best effort: the official image runs with `log_bin=0` (checked), and Nextcloud asks for ROW only when a binary log is on. Then a fresh
+  database `ncw_<flavor>` (utf8mb4, `utf8mb4_general_ci`, as the manual recommends) and a grant to the user that the service creates from `MARIADB_USER` and
+  `MARIADB_PASSWORD` (root password from `MARIADB_ROOT_PASSWORD`, health check `healthcheck.sh --connect --innodb_initialized`: both from the image documentation;
+  the statements ran against the pinned image). The host is 127.0.0.1 and the port the mapped one (`job.services.mariadb.ports['3306']`). `innodb_file_per_table` is 1 in the image.
+  The credentials are test values, only on the job's container.
+- Needs `pdo_mysql` in PHP; the script checks the extensions first. The SQL statements were run locally against the pinned image; the PHP/PDO path and `occ maintenance:install --database mysql` against it were not (no `pdo_mysql` here); the first CI run found the 1193 problem.
 
 ### Logs and timings
 

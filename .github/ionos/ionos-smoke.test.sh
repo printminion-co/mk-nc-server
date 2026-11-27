@@ -512,7 +512,19 @@ STUB
 #!/usr/bin/env bash
 echo "php[$PWD] $*" >> "$STUB_DIR/php.log"
 case "$1" in
-  -r) echo 8.3.0; exit 0 ;;
+  -r) if [ -n "${SMOKE_SQL:-}" ]; then
+        # the MariaDB root statements: the server version decides which isolation variable exists (10.x: tx_isolation, 11.1+: transaction_isolation)
+        echo "$SMOKE_SQL" >> "$STUB_DIR/sql.log"
+        case "$SMOKE_SQL" in
+          *transaction_isolation*) [ "${STUB_MARIADB:-}" != 10 ] || { echo "SQLSTATE[HY000]: General error: 1193 Unknown system variable 'transaction_isolation'" >&2; exit 255; } ;;
+          *tx_isolation*) [ "${STUB_MARIADB:-}" != 12 ] || { echo "SQLSTATE[HY000]: General error: 1193 Unknown system variable 'tx_isolation'" >&2; exit 255; } ;;
+          *binlog_format*) [ "${STUB_SQL_FAIL:-}" != binlog ] || { echo "SQLSTATE[HY000]: General error: 1227 Access denied; you need SUPER" >&2; exit 255; } ;;
+          *"CREATE DATABASE"*) [ "${STUB_SQL_FAIL:-}" != create ] || { echo "SQLSTATE[HY000]: General error: 1044 Access denied" >&2; exit 255; } ;;
+        esac
+        [ "${STUB_SQL_FAIL:-}" != both ] || case "$SMOKE_SQL" in *isolation*) echo "SQLSTATE[HY000]: General error: 1227 Access denied" >&2; exit 255 ;; esac
+        exit 0
+      fi
+      echo 8.3.0; exit 0 ;;
   -m) printf '%s\n' ctype curl dom fileinfo gd mbstring openssl posix session SimpleXML xmlreader xmlwriter zip zlib pdo_sqlite pdo_mysql libxml filter hash iconv intl; exit 0 ;;
   -d) exec "$REAL_PHP" "$@" ;;
 esac
@@ -565,7 +577,7 @@ run_up() { # run_up <world> [VAR=value ...]
     bash "$HERE/ionos-smoke-upgrade.sh"
 }
 sc_upgrade() {
-  local w r
+  local w r v
   setup_up u1; w="$ROOT/u1"; run_up u1
   r=u1-run
   check "a healthy upgrade passes the whole test" test "$(status $r)" = 0
@@ -640,6 +652,17 @@ sc_upgrade() {
   check "the install uses the mysql driver, the host and port, and a database of its own" grep -q 'maintenance:install.*--database mysql --database-host 127.0.0.1:3307 --database-name ncw_demo --database-user ncw_smoke' "$ROOT/u21/php.log"
   check "the database is prepared as root (isolation, binlog, drop, create, grant: five statements)" bash -c "test \$(grep -c '^php\[[^]]*\] -r' '$ROOT/u21/php.log') -ge 5"
   check "the MariaDB run is labelled as such" bash -c "grep -q 'upgrade smoke test (mariadb)' '$ROOT/u21-run.log'"
+  for v in 10 12; do
+    setup_up u21v$v; run_up u21v$v SMOKE_DB=mariadb SMOKE_DB_USER=ncw_smoke SMOKE_DB_PASS=pw SMOKE_DB_ROOT_PASS=rootpw STUB_MARIADB=$v
+    check "MariaDB $v.x (unknown-variable error 1193 for one of the two names): the run passes" test "$(status u21v$v-run)" = 0
+    check "MariaDB $v.x: READ-COMMITTED was set with the name the server knows" bash -c "grep -q \"SET GLOBAL $([ $v = 10 ] && echo tx_isolation || echo transaction_isolation) = 'READ-COMMITTED'\" '$ROOT/u21v$v/sql.log'"
+  done
+  setup_up u21b; run_up u21b SMOKE_DB=mariadb SMOKE_DB_USER=ncw_smoke SMOKE_DB_PASS=pw SMOKE_DB_ROOT_PASS=rootpw STUB_SQL_FAIL=both
+  check "MariaDB: an error other than 1193 on the isolation level fails the run with the server's message" bash -c "test '$(status u21b-run)' != 0 && grep -q 'Access denied' '$ROOT/u21b-run.log'"
+  setup_up u21c; run_up u21c SMOKE_DB=mariadb SMOKE_DB_USER=ncw_smoke SMOKE_DB_PASS=pw SMOKE_DB_ROOT_PASS=rootpw STUB_SQL_FAIL=binlog
+  check "MariaDB: binlog_format is best effort (the image runs without a binary log): a refusal does not fail the run" test "$(status u21c-run)" = 0
+  setup_up u21d; run_up u21d SMOKE_DB=mariadb SMOKE_DB_USER=ncw_smoke SMOKE_DB_PASS=pw SMOKE_DB_ROOT_PASS=rootpw STUB_SQL_FAIL=create
+  check "MariaDB: a failing CREATE DATABASE fails the run" test "$(status u21d-run)" != 0
   setup_up u22; run_up u22 SMOKE_DB=mariadb SMOKE_DB_USER=ncw_smoke
   check "MariaDB without the other credentials fails" test "$(status u22-run)" != 0
   setup_up u23; run_up u23 SMOKE_DB=postgres
