@@ -119,7 +119,8 @@ candidate_setup() {
   git -C "$work" remote add upstream "$UPSTREAM_URL"
   git -C "$work" remote add fork "$FORK_URL"
   if [ -n "${GH_TOKEN:-}" ] && [[ "$FORK_URL" == https://github.com/* ]]; then
-    git -C "$work" config "http.https://github.com/.extraheader" "AUTHORIZATION: basic $(token_header_b64)"
+    # only for the fork: upstream's public repository is fetched without credentials
+    git -C "$work" config "http.${FORK_URL}.extraheader" "AUTHORIZATION: basic $(token_header_b64)"
   fi
   git -C "$work" config commit.gpgsign false   # candidate commits stay unsigned; the promoter re-signs
   git -C "$work" fetch -q --filter=blob:none upstream "+refs/tags/v${LINE}.*:refs/tags/v${LINE}.*"

@@ -128,6 +128,13 @@ All 22 apps of `apps-upstream/` and the 5 of `apps-flavor1/` were built from the
 `engines` warnings (EBADENGINE, for example Node ^22 in some apps) are warnings only; no app broke on Node 24.
 What a local run cannot show: the runner's PHP is also 8.3, but its Composer version may differ.
 
+## Tokens
+
+The `plan` and `publish` jobs only use the default `GITHUB_TOKEN` and only call this repository's API. The
+build never uses the sync token and never reads `nextcloud/*` through the API, so the `nextcloud`
+organization's rule against fine-grained tokens with a lifetime over 366 days does not touch it (see
+`ionos-app-pins.md`). Submodules are fetched over git without credentials.
+
 ## Open items
 
 - The design says an app recipe override is a `build:` entry in the flavor manifest. The tool does not
