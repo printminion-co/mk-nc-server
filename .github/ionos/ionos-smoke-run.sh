@@ -34,34 +34,25 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 export LOG_PREFIX=ionos-smoke
 # shellcheck source=ionos-lib.sh
 . "$HERE/ionos-lib.sh"
+# shellcheck source=ionos-smoke-lib.sh
+. "$HERE/ionos-smoke-lib.sh"
 
 WORK=${WORK:?WORK is required}
 PHP=${PHP:-php}
 TMP_ROOT=${SMOKE_TMP:-${RUNNER_TEMP:-/tmp}/ionos-smoke}
 LOGS=${SMOKE_LOGS:-$WORK/smoke-logs}
 ALLOWLIST=${SMOKE_ALLOWLIST:-$HERE/ionos-smoke-log-allowlist.txt}
-BREAK=${SMOKE_BREAK:-none}
+# a break that is meant for the upgrade smoke test (ionos-smoke-upgrade.sh) leaves these archives alone
+BREAK=$(smoke_break_for fresh "${SMOKE_BREAK:-none}")
 ADMIN_USER=${SMOKE_ADMIN_USER:-admin}
 ADMIN_PASS=${SMOKE_ADMIN_PASS:-Smoke-Test-Admin-Pw-1}
 if [ -z "${FLAVORS_DIR:-}" ]; then FLAVORS_DIR="$(build_root)/IONOS"; fi
 if [ -n "${NCW:-}" ]; then read -r -a NCW_CMD <<<"$NCW"; else NCW_CMD=(node "$(build_root)/IONOS/tools/src/cli.ts"); fi
 read -r -a SERVER_EXTRA <<<"${SMOKE_SERVER_ARGS:-}"
-NAME_RE='^[a-z][a-z0-9]*(-[a-z0-9]+)*$'
-# what Nextcloud 33 needs (admin manual, system requirements); sqlite is the database of the smoke test
-REQUIRED_EXTENSIONS=(ctype curl dom fileinfo filter gd hash iconv libxml mbstring openssl pdo_sqlite posix session simplexml xmlreader xmlwriter zip zlib)
-
-SERVER_PID=""
-stop_server() {
-  [ -z "$SERVER_PID" ] || { kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true; SERVER_PID=""; }
-}
 trap stop_server EXIT
 
 # ---- PHP extensions: say what is missing before anything is installed
-have=$("$PHP" -m | tr '[:upper:]' '[:lower:]')
-missing=()
-for e in "${REQUIRED_EXTENSIONS[@]}"; do grep -qx "$e" <<<"$have" || missing+=("$e"); done
-[ ${#missing[@]} -eq 0 ] || die "PHP lacks extensions Nextcloud needs: ${missing[*]}"
-log "php: $("$PHP" -r 'echo PHP_VERSION;')"
+smoke_check_php sqlite
 
 shopt -s nullglob
 zips=("$WORK"/out/*.zip)
@@ -71,19 +62,12 @@ mkdir -p "$LOGS" "$TMP_ROOT"
 failed_flavors=()
 tested=0
 
-free_port() {
-  local p=${SMOKE_PORT:-18080}
-  while (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null; do p=$((p + 1)); done
-  echo "$p"
-}
-
 # smoke_one <archive>: returns 0 when the archive passed, 1 when it did not
 smoke_one() {
-  local zip=$1 base flavor dir tree ok=true name required def rc port url
+  local zip=$1 base flavor dir tree ok=true rc
   base=$(basename "$zip")
-  [[ $base =~ ^ncw-(.+)-v[0-9][0-9A-Za-z.]*\.zip$ ]] || { echo "::error::${LOG_PREFIX}: $base is not named ncw-<flavor>-v<version>.zip"; return 1; }
-  flavor=${BASH_REMATCH[1]}
-  [[ $flavor =~ $NAME_RE ]] || { echo "::error::${LOG_PREFIX}: '$flavor' in $base is not a flavor name"; return 1; }
+  smoke_flavor_of_archive "$zip" || return 1
+  flavor=$FLAVOR
   dir="$LOGS/$flavor"; tree="$TMP_ROOT/$flavor"
   mkdir -p "$dir"
   echo "::group::smoke test: $flavor ($base)"
@@ -109,16 +93,8 @@ smoke_one() {
 
   [ -f "$tree/ncw-configure.sh" ] || { bad "the archive has no ncw-configure.sh"; rm -rf "$tree"; echo "::endgroup::"; return 1; }
 
-  # the variables the flavor declares: a test value for the required ones, the declared default for the others
-  while IFS=$'\t' read -r name required def; do
-    [ -n "$name" ] || continue
-    [[ $name =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { bad "the flavor declares the variable '$name', which is no variable name"; continue; }
-    if [ "$required" = true ]; then
-      export "$name=smoke-test-value-$(tr '[:upper:]_' '[:lower:]-' <<<"$name")"
-    elif [ -n "$def" ]; then
-      export "$name=$def"
-    fi
-  done < <(resolved_env "$dir/resolved.yaml")
+  # the variables the flavor declares
+  smoke_export_env "$dir/resolved.yaml"
 
   # install from the command line on SQLite
   log "$flavor: occ maintenance:install"
@@ -135,49 +111,14 @@ smoke_one() {
       cat "$dir/configure.log" >&2; bad "ncw-configure.sh failed, see configure.log"
     else cat "$dir/configure.log"; fi
 
-    # serve the tree: php -S, no router (index.php/remote.php paths)
-    port=$(free_port); url="http://localhost:$port"
-    ( cd "$tree" && PHP_CLI_SERVER_WORKERS=4 exec "$PHP" -d memory_limit=512M -S "127.0.0.1:$port" -t "$tree" "${SERVER_EXTRA[@]}" ) \
-      > "$dir/php-server.log" 2>&1 &
-    SERVER_PID=$!
-    local up=false
-    for _ in $(seq 120); do
-      kill -0 "$SERVER_PID" 2>/dev/null || break
-      if curl -s -o /dev/null --max-time 5 "$url/status.php"; then up=true; break; fi
-      sleep 0.5
-    done
-    if [ "$up" != true ]; then
-      bad "the web server did not come up on $url"; tail -n 20 "$dir/php-server.log" >&2 || true
-    else
-      log "$flavor: probes against $url"
-      if ! SMOKE_ADMIN_USER=$ADMIN_USER SMOKE_ADMIN_PASS=$ADMIN_PASS bash "$HERE/ionos-smoke-probes.sh" "$url" "$dir/probes" > "$dir/probes.log" 2>&1; then
-        cat "$dir/probes.log" >&2; bad "probes failed, see probes.log"
-      else cat "$dir/probes.log"; fi
-    fi
-
-    log "$flavor: cron.php"
-    rc=0; ( cd "$tree" && timeout 900 "$PHP" cron.php ) > "$dir/cron.log" 2>&1 || rc=$?
-    [ "$rc" -eq 0 ] || { tail -n 20 "$dir/cron.log" >&2; bad "cron.php failed (exit $rc)"; }
-
-    log "$flavor: occ files:scan --all"
-    rc=0; ( cd "$tree" && timeout 900 "$PHP" occ files:scan --all ) > "$dir/scan.log" 2>&1 || rc=$?
-    [ "$rc" -eq 0 ] || { tail -n 20 "$dir/scan.log" >&2; bad "occ files:scan --all failed (exit $rc)"; }
-
-    log "$flavor: app states"
-    rc=0; ( cd "$tree" && timeout 300 "$PHP" occ app:list --output=json_pretty ) > "$dir/app-list.json" 2> "$dir/app-list.err" || rc=$?
-    if [ "$rc" -ne 0 ]; then cat "$dir/app-list.err" >&2; bad "occ app:list failed (exit $rc)"
-    elif ! bash "$HERE/ionos-smoke-apps.sh" "$dir/app-list.json" "$dir/resolved.yaml" > "$dir/apps.log" 2>&1; then
-      cat "$dir/apps.log" >&2; bad "the app states do not match the resolved flavor"
-    else cat "$dir/apps.log"; fi
+    # serve the tree, probes, cron.php, files:scan, app states: the part the upgrade smoke test shares
+    smoke_checks "$tree" "$dir" "$dir/resolved.yaml"
   fi
   stop_server
 
   # the log: after everything above has run
   if [ -f "$tree/data/nextcloud.log" ]; then cp "$tree/data/nextcloud.log" "$dir/nextcloud.log"; fi
-  log "$flavor: nextcloud.log"
-  if ! bash "$HERE/ionos-smoke-logs.sh" "$dir/nextcloud.log" "$ALLOWLIST" > "$dir/logs.log" 2>&1; then
-    cat "$dir/logs.log" >&2; bad "the log check failed"
-  else cat "$dir/logs.log"; fi
+  smoke_log_check "$dir/nextcloud.log" "$dir"
 
   [ "${SMOKE_KEEP:-false}" = true ] || rm -rf "$tree"
   echo "::endgroup::"

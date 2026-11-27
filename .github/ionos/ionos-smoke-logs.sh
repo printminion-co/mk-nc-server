@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # Checks nextcloud.log of a fresh install (every entry is new).
-#   ionos-smoke-logs.sh <nextcloud.log> <allowlist file>
+#   ionos-smoke-logs.sh <nextcloud.log> <allowlist file> [<expected incompatible apps file>]
 # Fails on
 #   - any line with "Disabled incompatible app", whatever its level and whatever the allow-list says, and
 #   - any entry at level 3 (error) or higher whose message does not match an entry of the allow-list.
 # A line that is not JSON counts as an entry at level error (its raw text is its message). The allow-list has one
 # extended regular expression per line (grep -E, applied to the message); empty lines and lines starting with #
 # are ignored; an entry that is blank or not a valid expression fails the check (a blank one would allow everything).
+# The optional third argument is for the upgrade smoke test only: a file with one app id per line, the apps of
+# removed-apps.json that occ refuses to disable on the old version (always-enabled core apps such as workflowengine).
+# `occ upgrade` takes those out itself and logs exactly "Disabled incompatible app: <id>" (at level info) for each
+# one; that line, for exactly those ids, is accepted. Any other app, or any other wording, still fails.
 # A log file that does not exist counts as no entries (a clean install may write none).
 set -euo pipefail
 
@@ -15,9 +19,17 @@ export LOG_PREFIX=ionos-smoke
 # shellcheck source=ionos-lib.sh
 . "$HERE/ionos-lib.sh"
 
-[ $# -eq 2 ] || die "usage: ionos-smoke-logs.sh <nextcloud.log> <allowlist file>"
+if [ $# -lt 2 ] || [ $# -gt 3 ]; then die "usage: ionos-smoke-logs.sh <nextcloud.log> <allowlist file> [<expected incompatible apps file>]"; fi
 LOG=$1
 ALLOW=$2
+EXPECTED=${3:-}
+expected=()
+if [ -n "$EXPECTED" ]; then
+  [ -f "$EXPECTED" ] || die "no file of expected incompatible apps at $EXPECTED"
+  while IFS= read -r id || [ -n "$id" ]; do
+    [ -z "$id" ] || { [[ $id =~ ^[a-z0-9_]+$ ]] || die "$EXPECTED lists '$id', which is no app id"; expected+=("$id"); }
+  done < "$EXPECTED"
+fi
 [ -f "$ALLOW" ] || die "no allow-list at $ALLOW"
 
 patterns=()
@@ -40,6 +52,15 @@ fi
 problems=0
 if grep -F -q 'Disabled incompatible app' "$LOG"; then
   while IFS= read -r l; do
+    msg=$(jq -r '(.message? // "") | tostring' <<<"$l" 2>/dev/null || true)
+    hit=false
+    for id in "${expected[@]}"; do
+      [ "$msg" = "\\OC\\Updater::incompatibleAppDisabled: Disabled incompatible app: $id" ] && hit=true
+    done
+    if [ "$hit" = true ]; then
+      log "an expected app was disabled as incompatible by occ upgrade (it is removed from the flavor): ${msg##*: }"
+      continue
+    fi
     echo "::error::${LOG_PREFIX}: an app was disabled as incompatible (never allowed): ${l:0:400}"
     problems=$((problems + 1))
   done < <(grep -F 'Disabled incompatible app' "$LOG")

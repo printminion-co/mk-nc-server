@@ -6,4 +6,10 @@
 # short: an entry hides a real problem as soon as it is wider than the one message. Empty lines and lines starting
 # with # are ignored. A "Disabled incompatible app" line fails the smoke test whatever this file says.
 #
-# (none yet)
+#
+# Message: "No application directories are marked as writable." (level error, app "no app in context", only while
+#   running `occ upgrade`; seen in the upgrade smoke test of flavor1 on 33.0.9 -> 33.0.9.1.12).
+# Source: OC_App::getInstallPath() during the upgrade. Every flavor sets apps_paths with writable=false in
+#   config/00-apps-paths.config.php (no app store, no installs into the tree: 03-apps.md), so the updater finds no
+#   place to install app updates from. That is the design, not a defect. Not seen in the fresh install.
+^No application directories are marked as writable\.$
