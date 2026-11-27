@@ -9,8 +9,8 @@
 #     lists, except composer.json, composer.lock, package.json and package-lock.json;
 #   - *.map.license files (symbolic links in the repository) are removed, as upstream does;
 #   - config/config.php and data/ are removed, empty folders are removed;
-#   - a symbolic link left in the tree is an error (the official archive has none and the tool cannot
-#     ship broken ones).
+#   - a symbolic link to a regular file inside the tree is replaced by a copy of the file (as zip does for
+#     the official archive); any other symbolic link left in the tree is an error.
 # It also writes $WORK/base-release (for example 33.0.9). Needs git, rsync and find.
 #
 # Environment:  WORK, and optionally ROOT (default: the top level of the current checkout)
@@ -59,6 +59,18 @@ find "$TREE" -name '*.map.license' \( -type f -o -type l \) -delete
 rm -rf "$TREE/config/config.php" "$TREE/data"
 find "$TREE" -type d -empty -delete
 mkdir -p "$TREE"
+
+# A link to a regular file inside the tree is replaced by a copy of that file, which is what zip stores when it
+# packs the official archive (built apps such as related_resources ship *.js.license links). Links that are
+# broken, point at a folder or point outside the tree are left alone and fail below.
+tree_real=$(readlink -f "$TREE")
+while IFS= read -r -d '' l; do
+  target=$(readlink -f "$l" || true)
+  if [ -n "$target" ] && [ -f "$target" ] && [[ $target == "$tree_real"/* ]]; then
+    rm "$l"
+    cp -p "$target" "$l"
+  fi
+done < <(find "$TREE" -type l -print0)
 
 links=$(find "$TREE" -type l | head -n 20)
 if [ -n "$links" ]; then
