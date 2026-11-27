@@ -1,0 +1,6 @@
+# Apps whose clean rebuild is known NOT to be bit-identical to an earlier build, although the app commit, recipe and
+# toolchain are the same. ionos-cache-check.sh still rebuilds and compares them, but a difference is reported as
+# "known to differ" in the job summary and opens no issue. One app per line: "<app id> <reason>"; blank lines and
+# lines starting with # are ignored. Add an app only after measuring two clean builds and finding the cause, and
+# put the finding in ionos-build.md ("Reproducibility of the app builds").
+calendar webpack/terser name mangling is not stable: two chunks (js/calendar-contacts-menu.js, js/calendar-reference.js) get other identifier names in other builds (measured: five builds, five different checksums)

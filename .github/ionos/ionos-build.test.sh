@@ -122,6 +122,24 @@ case "$1" in
         echo "$tag" >> "$S/deleted.log" ;;
       *) echo "stub gh: unsupported release $sub" >&2; exit 2 ;;
     esac ;;
+  issue)
+    sub="$2"; shift 2
+    [ -f "$S/issues.json" ] || echo '[]' > "$S/issues.json"
+    isave() { jq "$1" "$S/issues.json" > "$S/i.tmp" && mv "$S/i.tmp" "$S/issues.json"; }
+    case "$sub" in
+      list) jq -c '[.[]|select(.state=="open")|{number,title}]' "$S/issues.json" ;;
+      create)
+        title=""; notes=""
+        while [ $# -gt 0 ]; do case "$1" in --title) title="$2"; shift 2 ;; --body-file) notes="$2"; shift 2 ;; *) shift ;; esac; done
+        n="$(jq 'map(.number)|max // 0' "$S/issues.json")"
+        isave ". + [{\"number\":$((n + 1)),\"title\":$(jq -Rn --arg t "$title" '$t'),\"state\":\"open\",\"body\":$(jq -Rn --arg t "$(cat "$notes")" '$t'),\"comments\":[]}]"
+        echo "https://example.invalid/issues/$((n + 1))" ;;
+      comment)
+        num="$1"; shift; notes=""
+        while [ $# -gt 0 ]; do case "$1" in --body-file) notes="$2"; shift 2 ;; *) shift ;; esac; done
+        isave "map(if .number == $num then .comments += [$(jq -Rn --arg t "$(cat "$notes")" '$t')] else . end)" ;;
+      *) echo "stub gh: unsupported issue $sub" >&2; exit 2 ;;
+    esac ;;
   *) echo "stub gh: unsupported: $*" >&2; exit 2 ;;
 esac
 STUB
@@ -1279,7 +1297,100 @@ sc_cache() {
   check "workflow: the prefix is the one the script uses" bash -c ". '$HERE/ionos-cache-lib.sh'; [ \"\$CACHE_PREFIX\" = ionos-app-build-v1- ]"
 }
 
-ALL="plan release_plan retention publish release_publish select apps recipes server assemble package release_package cache"
+# ---------------------------------------------------------------- weekly comparison
+cc_run() { # cc_run <world> [VAR=value ...]: the weekly check on the cache folder of that world
+  local n="$1"; shift
+  run_build "$n" ionos-cache-check.sh CACHE_DIR="$ROOT/$n/cache" REPORT="$ROOT/$n/report.md" GITHUB_STEP_SUMMARY="$ROOT/$n/summary.md" "$@"
+}
+cc_issue() { # cc_issue <world> [VAR=value ...]
+  local n="$1"; shift
+  run_in "$n" ionos-cache-check-issue.sh REPORT="$ROOT/$n/report.md" RUN_URL=https://example.invalid/run/1 "$@"
+}
+issues() { jq -r "$2" "$ROOT/$1/state/issues.json"; }
+sc_cache_check() {
+  need_apps a b d; fork w1 a b d
+  run_build w1 ionos-build-select.sh FLAVORS=flavor1
+  cache_run w1
+  : > "$ROOT/w1/cmd.log"
+  cc_run w1 WORK="$ROOT/w1/cwork"
+  check "weekly: identical clean rebuilds are no mismatch and the job succeeds" test "$(status w1)" = 0 -a "$(output w1 mismatch)" = false
+  check "weekly: every cached app is rebuilt without the cache (npm ci for a and d)" test "$(npm_calls w1 a)" = 1 -a "$(npm_calls w1 d)" = 1
+  check "weekly: the cache folder is not changed (no save, no restore into it)" test "$(meta w1 .key a)" = "$(jq -r .a.key "$ROOT/w1/work/app-builds.json")"
+  check "weekly: a report is written that says all matched" grep -q 'mismatch: none' "$ROOT/w1/report.md"
+  check "weekly: the report counts the compared apps" grep -q 'compared: 3' "$ROOT/w1/report.md"
+
+  # a mismatch: the clean rebuild differs from the cached build (the stub writes another file)
+  cc_run w1 WORK="$ROOT/w1/cwork" NPM_OUT=other
+  check "weekly: a differing rebuild is reported as mismatch" test "$(status w1)" = 0 -a "$(output w1 mismatch)" = true
+  check "weekly: the report names the app with both checksums" grep -q 'a .*cached=[0-9a-f]\{64\}.*rebuilt=[0-9a-f]\{64\}' "$ROOT/w1/report.md"
+  check "weekly: and the apps that matched are not named as mismatch" bash -c "grep '^mismatch' '$ROOT/w1/report.md' | grep -qw a && grep '^mismatch' '$ROOT/w1/report.md' | grep -qw d && ! grep '^mismatch' '$ROOT/w1/report.md' | grep -qw b"
+  check "weekly: the report is in the job summary" grep -q '^mismatch: a d' "$ROOT/w1/summary.md"
+  check "weekly: the cache itself is left alone for the next build to deal with" test "$(cat "$ROOT/w1/cache/a/tree/js/built.js")" = built
+
+  # the issue: one issue, a comment on reruns, nothing without a mismatch
+  echo '[]' > "$ROOT/w1/state/issues.json"
+  cc_issue w1
+  check "issue: the first mismatch opens one issue with the fixed title prefix" test "$(issues w1 length)" = 1 -a "$(issues w1 '.[0].title|startswith("IONOS app cache check:")')" = true
+  check "issue: the body lists the apps" bash -c "jq -r '.[0].body' '$ROOT/w1/state/issues.json' | grep -qw a"
+  cc_issue w1
+  check "issue: a rerun with an open issue adds a comment instead of a second issue" test "$(issues w1 length)" = 1 -a "$(issues w1 '.[0].comments|length')" = 1
+  check "issue: the comment names the run" bash -c "jq -r '.[0].comments[0]' '$ROOT/w1/state/issues.json' | grep -q 'example.invalid/run/1'"
+  jq '.[0].state="closed"' "$ROOT/w1/state/issues.json" > "$ROOT/w1/state/i.tmp" && mv "$ROOT/w1/state/i.tmp" "$ROOT/w1/state/issues.json"
+  cc_issue w1
+  check "issue: a closed issue does not count, a new one is opened" test "$(issues w1 length)" = 2
+  echo '[{"number":9,"title":"Something else","state":"open","body":"","comments":[]}]' > "$ROOT/w1/state/issues.json"
+  cc_issue w1
+  check "issue: an open issue with another title does not count" test "$(issues w1 length)" = 2
+  cc_run w1 WORK="$ROOT/w1/cwork"
+  echo '[]' > "$ROOT/w1/state/issues.json"; : > "$ROOT/w1/state/calls.log"
+  cc_issue w1
+  check "issue: no mismatch means no issue and no comment" test "$(issues w1 length)" = 0 -a "$(status w1)" = 0 -a "$(n_calls w1 'issue')" = 0
+  rm -f "$ROOT/w1/report.md"
+  cc_issue w1
+  check "issue: no report means nothing to do, and no gh call" test "$(n_calls w1 'issue')" = 0
+
+  # apps that are not in the cache, or cached under another key, are skipped and never rebuilt
+  rm -rf "$ROOT/w1/cache/b"; : > "$ROOT/w1/cmd.log"
+  cc_run w1 WORK="$ROOT/w1/cwork" NPM_OUT=other
+  check "weekly: an app that is not in the cache is skipped, not a mismatch, and not rebuilt" bash -c "test \"\$(grep -c 'apps-x/b: ' '$ROOT/w1/cmd.log')\" = 0 && ! grep '^mismatch' '$ROOT/w1/report.md' | grep -qw b && grep -q '^mismatch: a d' '$ROOT/w1/report.md'"
+  check "weekly: and the skipped app is listed with the reason" grep -q 'skipped: .*b (not in the cache)' "$ROOT/w1/report.md"
+  : > "$ROOT/w1/cmd.log"
+  cc_run w1 WORK="$ROOT/w1/cwork" STUB_NODE_VERSION=v22.9.0 NPM_OUT=other
+  check "weekly: a cache built with other toolchain versions has other keys: skipped, no mismatch, nothing rebuilt" bash -c "test \"\$(cat '$ROOT/w1/gh_output' | grep -c '^mismatch=false')\" = 1 && test ! -s '$ROOT/w1/cmd.log' && grep -q 'compared: 0' '$ROOT/w1/report.md' && grep -q 'another key' '$ROOT/w1/report.md'"
+  check "weekly: an empty comparison is a warning, not a silent pass" grep -q '::warning::.*nothing was compared' "$ROOT/w1/out.log"
+
+  # an app that is known to differ is compared but its difference is no mismatch and no issue
+  printf '# test\nd the stub for d is declared nondeterministic\n' > "$ROOT/w1/known.txt"
+  cache_run w1
+  cc_run w1 WORK="$ROOT/w1/cwork" NPM_OUT=other KNOWN_FILE="$ROOT/w1/known.txt"
+  check "weekly: a known-nondeterministic app that differs is reported as known and is no mismatch" bash -c "grep -q '^mismatch: a\$' '$ROOT/w1/report.md' && grep -q '^known to differ: d' '$ROOT/w1/report.md' && grep -q 'known: the stub for d' '$ROOT/w1/report.md'"
+  cc_run w1 WORK="$ROOT/w1/cwork" NPM_OUT=other KNOWN_FILE="$ROOT/w1/known.txt"
+  check "weekly: the real known file lists calendar with its reason" bash -c "grep -q '^calendar ' '$HERE/ionos-cache-check-known.txt'"
+  printf 'a x\nd y\n' > "$ROOT/w1/known.txt"
+  cc_run w1 WORK="$ROOT/w1/cwork" NPM_OUT=other KNOWN_FILE="$ROOT/w1/known.txt"
+  check "weekly: when every difference is known there is no mismatch and no issue is asked for" test "$(output w1 mismatch)" = false -a "$(status w1)" = 0
+
+  # no cache at all
+  fork w2 a; run_build w2 ionos-build-select.sh
+  cc_run w2 WORK="$ROOT/w2/cwork"
+  check "weekly: no cache folder means nothing to compare, a warning, no mismatch" test "$(status w2)" = 0 -a "$(output w2 mismatch)" = false -a -z "$(ls "$ROOT/w2/cmd.log" 2>/dev/null)"
+
+  # which apps: every pinned app of the app folders, not what a flavor selects
+  fork w3 a b d
+  cache_run w3 2>/dev/null; run_build w3 ionos-build-select.sh FLAVORS=flavor2
+  cache_run w3
+  cc_run w3 WORK="$ROOT/w3/cwork"
+  check "weekly: all pinned apps of all app folders are compared, whatever the flavors select" grep -q 'compared: 3' "$ROOT/w3/report.md"
+
+  # the workflow
+  local wf="$HERE/../workflows/ionos-app-cache-check.yml"
+  check "weekly workflow: a schedule and a manual start" bash -c "grep -q '^  schedule:' '$wf' && grep -q '^  workflow_dispatch:' '$wf'"
+  check "weekly workflow: top-level permissions are none beyond contents read" bash -c "sed -n '/^permissions:/,/^[a-z]/p' '$wf' | grep -q 'contents: read'"
+  check "weekly workflow: issues write only in the job that opens the issue" test "$(grep -c 'issues: write' "$wf")" = 1
+  check "weekly workflow: the job that builds app code has no write permission" bash -c "awk '/^  check:/,/^  report:/' '$wf' | grep -q 'contents: read' && ! awk '/^  check:/,/^  report:/' '$wf' | grep -q 'write'"
+}
+
+ALL="plan release_plan retention publish release_publish select apps recipes server assemble package release_package cache cache_check"
 if [ $# -gt 0 ]; then SELECT=("$@"); else read -r -a SELECT <<< "$ALL"; fi
 for s in "${SELECT[@]}"; do
   echo "scenario: $s"

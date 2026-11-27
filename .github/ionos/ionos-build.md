@@ -301,6 +301,16 @@ An app of the flavor without a recorded build fails the flavor. Release builds u
 NOTHING IS SAVED (a clean run must not replace what other runs use; an equal key could not be overwritten anyway). The used keys and checksums are
 still recorded in `cached_builds`. Use it for a fully clean release build or to see whether the cache drifted.
 
+**Weekly job** (`ionos-app-cache-check.yml`, Mondays 03:23 UTC and manual): job `check` (`contents: read`) restores the same folder, then
+`ionos-cache-check.sh` takes every pinned app of every `apps-*` folder (not only what a flavor selects), skips the ones that are not in the cache or are
+cached under another key (other commit, recipe, Node or PHP: nothing to compare, nothing is rebuilt for them), rebuilds the rest WITHOUT the cache with
+the same script (`ionos-build-apps.sh`, `NO_CACHE=true`) and compares each rebuilt checksum with the cached one of the same key. It never writes the cache.
+It writes `report.md` (also in the job summary) and the output `mismatch`. If nothing was compared (empty cache, or all keys changed) it warns. A build
+failure fails the job. Job `report` (`contents: read`, `issues: write`, runs no app code, only the report as a workflow artifact) runs
+`ionos-cache-check-issue.sh` only on a mismatch: ONE issue titled `IONOS app cache check: rebuilt apps differ from the cache`; when an open issue
+with that title exists a comment is added instead, so reruns do not spam. No mismatch: no issue. The cache lives on the branch the build runs on,
+so the weekly job sees the cache of the default branch (see the note in the workflows).
+
 ### Reproducibility of the app builds (measured)
 
 Before the weekly comparison was built, all 27 pinned apps (22 of `apps-upstream/`, 5 of `apps-flavor1/`, the pins of commit
