@@ -77,6 +77,38 @@ cache_tree_checksum() {
   ) | sha256sum | cut -d' ' -f1
 }
 
+# cache_tree_diff <cached tree> <rebuilt tree> [limit, default 30]: which files differ, for a human who has to find
+# out why two checksums differ. Same files as the checksum (CACHE_CHECKSUM_IGNORE does not show). Prints nothing for
+# equal trees, else a summary line, then at most <limit> lines "<marker>  <path>  cached=<size> rebuilt=<size>" sorted
+# by path (markers: changed, only in cache, only in rebuild; a link shows "link"), then "... and N more". Control
+# characters in paths are shown as "?".
+cache_tree_diff() {
+  local a="$1" b="$2" limit="${3:-30}" p shown
+  local -A ha=() hb=() sa=() sb=()
+  cache__list() { # cache__list <dir> <hash array> <size array>
+    local -n _h="$2" _s="$3"; local line hash path
+    while IFS= read -r -d '' line; do
+      hash="${line%%  *}"; path="${line#*  ./}"; _h["$path"]="$hash"; _s["$path"]="$(stat -c %s -- "$1/$path") B"
+    done < <(cd "$1" && find . \( "${CACHE_CHECKSUM_IGNORE[@]}" \) -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum -z --)
+    while IFS= read -r -d '' path; do
+      _h["${path#./}"]="L:$(readlink -- "$1/$path")"; _s["${path#./}"]="link"
+    done < <(cd "$1" && find . \( "${CACHE_CHECKSUM_IGNORE[@]}" \) -prune -o -type l -print0)
+  }
+  cache__list "$a" ha sa; cache__list "$b" hb sb
+  local -a lines=(); local changed=0 oc=0 or=0
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    shown="${p//[^[:print:]]/?}"
+    if [ -z "${hb[$p]+x}" ]; then lines+=("only in cache  $shown  cached=${sa[$p]} rebuilt=-"); oc=$((oc + 1))
+    elif [ -z "${ha[$p]+x}" ]; then lines+=("only in rebuild  $shown  cached=- rebuilt=${sb[$p]}"); or=$((or + 1))
+    elif [ "${ha[$p]}" != "${hb[$p]}" ]; then lines+=("changed  $shown  cached=${sa[$p]} rebuilt=${sb[$p]}"); changed=$((changed + 1)); fi
+  done < <(printf '%s\n' "${!ha[@]}" "${!hb[@]}" | LC_ALL=C sort -u)
+  [ ${#lines[@]} -gt 0 ] || return 0
+  echo "${#lines[@]} files differ ($changed changed, $oc only in cache, $or only in rebuild)"
+  printf '%s\n' "${lines[@]:0:$limit}"
+  if [ ${#lines[@]} -gt "$limit" ]; then echo "... and $(( ${#lines[@]} - limit )) more"; fi
+}
+
 # cache_entry_valid <cache folder> <app id> <key>: succeeds when the cache holds a usable build of the app for
 # exactly this key: a real folder (never a link) with a tree and a readable meta.json whose key equals <key>
 # and whose checksum equals the checksum of the tree as it is now. Prints why not on failure (to stderr).

@@ -305,7 +305,7 @@ still recorded in `cached_builds`. Use it for a fully clean release build or to 
 `ionos-cache-check.sh` takes every pinned app of every `apps-*` folder (not only what a flavor selects), skips the ones that are not in the cache or are
 cached under another key (other commit, recipe, Node or PHP: nothing to compare, nothing is rebuilt for them), rebuilds the rest WITHOUT the cache with
 the same script (`ionos-build-apps.sh`, `NO_CACHE=true`) and compares each rebuilt checksum with the cached one of the same key. It never writes the cache.
-It writes `report.md` (also in the job summary) and the output `mismatch`. If nothing was compared (empty cache, or all keys changed) it warns. A build
+For every app whose checksum differs (known or not) it also lists WHICH FILES differ between the restored cache tree and the tree just rebuilt: at most 30 paths per app, marked `changed`, `only in cache` or `only in rebuild`, with both sizes, using the checksum's normalization (ignored patterns do not show; `cache_tree_diff` in `ionos-cache-lib.sh`). The list is in the job log, the summary and the issue body or comment (cut at 50000 bytes). It writes `report.md` (also in the job summary) and the output `mismatch`. If nothing was compared (empty cache, or all keys changed) it warns. A build
 failure fails the job. Job `report` (`contents: read`, `issues: write`, runs no app code, only the report as a workflow artifact) runs
 `ionos-cache-check-issue.sh` only on a mismatch: ONE issue titled `IONOS app cache check: rebuilt apps differ from the cache`; when an open issue
 with that title exists a comment is added instead, so reruns do not spam. No mismatch: no issue. The cache lives on the branch the build runs on,

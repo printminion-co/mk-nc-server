@@ -21,8 +21,15 @@ line=$(sed -n 's/^mismatch: //p' "$REPORT" | head -n1)
 { [ -n "$line" ] && [ "$line" != none ]; } || { log "no mismatch: no issue"; exit 0; }
 
 body=$(mktemp); trap 'rm -f "$body"' EXIT
+# GitHub refuses an issue body or comment above 65536 characters: the report is cut at 50000 bytes (the file lists
+# are at most 30 paths per app, so this only bites for very many differing apps)
+MAX_REPORT=50000
 {
-  cat "$REPORT"
+  if [ "$(wc -c < "$REPORT")" -gt "$MAX_REPORT" ]; then
+    head -c "$MAX_REPORT" "$REPORT"; echo; echo "(report cut at $MAX_REPORT bytes, the full report is in the job summary of the run)"
+  else
+    cat "$REPORT"
+  fi
   echo
   [ -z "$RUN_URL" ] || echo "Run: $RUN_URL"
   echo

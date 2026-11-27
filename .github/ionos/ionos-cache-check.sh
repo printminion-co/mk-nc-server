@@ -55,7 +55,7 @@ while read -r path; do
 done < <(pinned_app_paths "$ROOT")
 
 compared=$(wc -l < "$WORK/apps-all.txt")
-mismatched=(); known_diff=(); details=()
+mismatched=(); known_diff=(); details=(); filelists=()
 if [ "$compared" -gt 0 ]; then
   log "rebuilding $compared app(s) without the cache"
   env -u CACHE_DIR NO_CACHE=true WORK="$WORK" RECIPES_DIR="$RECIPES_DIR" DEFAULT_RECIPE_FILE="$DEFAULT_RECIPE_FILE" \
@@ -65,6 +65,10 @@ if [ "$compared" -gt 0 ]; then
     cached=$(jq -r '.checksum // ""' "$CACHE_DIR/$id/meta.json")
     rebuilt=$(jq -r --arg id "$id" '.[$id].checksum' "$WORK/app-builds.json")
     if [ "$cached" = "$rebuilt" ]; then continue; fi
+    # which files differ: the restored cache tree against the tree just rebuilt in the app folder (the same
+    # normalization as the checksum), for known apps too
+    files=$(cache_tree_diff "$CACHE_DIR/$id/tree" "$ROOT/$path" 30 || true)
+    [ -z "$files" ] || filelists+=("### Files of $id"$'\n\n```\n'"$files"$'\n```')
     reason=$(known "$id")
     if [ -n "$reason" ]; then
       known_diff+=("$id")
@@ -92,6 +96,11 @@ join() { local IFS=', '; echo "$*"; }
     echo "A clean rebuild of these apps differs from the cached build of the same key:"
     echo
     printf '%s\n' "${details[@]}"
+  fi
+  if [ ${#filelists[@]} -gt 0 ]; then
+    echo
+    echo "Files that differ between the cached tree and the clean rebuild (at most 30 per app; the checksum's ignored patterns are left out):"
+    for f in "${filelists[@]}"; do echo; echo "$f"; done
   fi
 } > "$REPORT"
 cat "$REPORT"

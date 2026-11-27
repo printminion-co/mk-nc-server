@@ -1287,6 +1287,26 @@ sc_cache() {
   mv "$t/x/y/f2" "$t/x/y/f"; : > "$t/new file"
   check "checksum: an added file (also with a space in its name) changes it" test "$(sum "$t")" != "$sum"
 
+  # cache_tree_diff: which files differ
+  local da="$ROOT/dx/cache" db="$ROOT/dx/rebuilt" out
+  rm -rf "$ROOT/dx"; mkdir -p "$da/js" "$db/js" "$da/lib" "$db/lib"
+  echo same > "$da/lib/s.php"; cp "$da/lib/s.php" "$db/lib/s.php"
+  echo old > "$da/js/c.js"; echo newer1 > "$db/js/c.js"; echo only > "$da/gone.txt"; echo only2 > "$db/js/new.js"
+  echo m1 > "$da/js/c.js.map"; echo m2 > "$db/js/c.js.map"; echo 1 > "$da/webpack-stats.json"; echo 2 > "$db/webpack-stats.json"
+  ln -s a "$da/l"; ln -s b "$db/l"
+  tdiff() { bash -c ". '$HERE/ionos-cache-lib.sh'; cache_tree_diff \"\$@\"" _ "$@"; }
+  out="$(tdiff "$da" "$db")"
+  check "diff: a changed file with both sizes" grep -q '^changed  js/c.js  cached=4 B rebuilt=7 B$' <<<"$out"
+  check "diff: a file only in the cache" grep -q '^only in cache  gone.txt  cached=5 B rebuilt=-$' <<<"$out"
+  check "diff: a file only in the rebuild" grep -q '^only in rebuild  js/new.js  cached=- rebuilt=6 B$' <<<"$out"
+  check "diff: a link with another target is changed" grep -q '^changed  l  cached=link rebuilt=link$' <<<"$out"
+  check "diff: equal files and the ignored patterns (maps, root webpack-stats.json) do not show" bash -c "! grep -q 's.php\|\.map\|webpack-stats' <<<'$out'"
+  check "diff: a summary line counts them" grep -q '^4 files differ (2 changed, 1 only in cache, 1 only in rebuild)$' <<<"$out"
+  check "diff: identical trees print nothing" test -z "$(tdiff "$da/lib" "$db/lib")"
+  rm -rf "$ROOT/dy"; mkdir -p "$ROOT/dy/a" "$ROOT/dy/b"; local i; for i in $(seq 1 45); do echo x > "$ROOT/dy/a/f$i"; done
+  out="$(tdiff "$ROOT/dy/a" "$ROOT/dy/b" 30)"
+  check "diff: at most 30 paths are listed and the rest is counted" test "$(grep -c '^only in cache' <<<"$out")" = 30 && grep -q '^\.\.\. and 15 more$' <<<"$out" && grep -q '^45 files differ' <<<"$out"
+
   # the workflow: restore, the static steps, the save, no_cache
   local wf="$HERE/../workflows/ionos-build.yml"
   check "workflow: input no_cache, a boolean that defaults to false" bash -c "grep -A3 '^      no_cache:' '$wf' | grep -q 'type: boolean' && grep -A4 '^      no_cache:' '$wf' | grep -q 'default: false'"
@@ -1327,6 +1347,11 @@ sc_cache_check() {
   check "weekly: the report is in the job summary" grep -q '^mismatch: a d' "$ROOT/w1/summary.md"
   check "weekly: the cache itself is left alone for the next build to deal with" test "$(cat "$ROOT/w1/cache/a/tree/js/built.js")" = built
 
+  # which files differ: from the restored cache tree and the clean rebuild, same normalization as the checksum
+  check "weekly: the report lists the files that differ with a marker and both sizes" bash -c "grep -q 'only in cache  js/built.js  cached=6 B rebuilt=-' '$ROOT/w1/report.md' && grep -q 'only in rebuild  js/other.js  cached=- rebuilt=6 B' '$ROOT/w1/report.md'"
+  check "weekly: the file list is in the job log too" grep -q 'only in rebuild  js/other.js' "$ROOT/w1/out.log"
+  check "weekly: an app whose rebuild is identical has no file list" bash -c "! grep -q 'b/' '$ROOT/w1/report.md' && ! grep -q 'files of b' '$ROOT/w1/report.md'"
+
   # the issue: one issue, a comment on reruns, nothing without a mismatch
   echo '[]' > "$ROOT/w1/state/issues.json"
   cc_issue w1
@@ -1334,7 +1359,16 @@ sc_cache_check() {
   check "issue: the body lists the apps" bash -c "jq -r '.[0].body' '$ROOT/w1/state/issues.json' | grep -qw a"
   cc_issue w1
   check "issue: a rerun with an open issue adds a comment instead of a second issue" test "$(issues w1 length)" = 1 -a "$(issues w1 '.[0].comments|length')" = 1
+  check "issue: the comment carries the file lists" bash -c "jq -r '.[0].comments[0]' '$ROOT/w1/state/issues.json' | grep -q 'only in rebuild  js/other.js'"
+  check "issue: the body carries the file lists" bash -c "jq -r '.[0].body' '$ROOT/w1/state/issues.json' | grep -q 'only in cache  js/built.js'"
   check "issue: the comment names the run" bash -c "jq -r '.[0].comments[0]' '$ROOT/w1/state/issues.json' | grep -q 'example.invalid/run/1'"
+  { cat "$ROOT/w1/report.md"; head -c 90000 /dev/zero | tr '\0' 'x'; } > "$ROOT/w1/report-big.md"
+  mv "$ROOT/w1/report.md" "$ROOT/w1/report-small.md"; mv "$ROOT/w1/report-big.md" "$ROOT/w1/report.md"
+  echo '[]' > "$ROOT/w1/state/issues.json"
+  cc_issue w1
+  check "issue: a huge report is cut so that the body stays below GitHub's limit, with a note" bash -c "test \$(jq -r '.[0].body|length' '$ROOT/w1/state/issues.json') -lt 65000 && jq -r '.[0].body' '$ROOT/w1/state/issues.json' | grep -q 'cut'"
+  mv "$ROOT/w1/report-small.md" "$ROOT/w1/report.md"
+  echo '[]' > "$ROOT/w1/state/issues.json"; cc_issue w1; cc_issue w1
   jq '.[0].state="closed"' "$ROOT/w1/state/issues.json" > "$ROOT/w1/state/i.tmp" && mv "$ROOT/w1/state/i.tmp" "$ROOT/w1/state/issues.json"
   cc_issue w1
   check "issue: a closed issue does not count, a new one is opened" test "$(issues w1 length)" = 2
