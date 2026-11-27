@@ -1,8 +1,9 @@
 # Dev build: builds the server and every needed out-of-tree app from source, assembles and validates
-# every flavor with the tool pinned by the checked-out dev branch (IONOS/tools), and publishes the
+# every flavor with the tool pinned by the checked-out dev branch (IONOS/tools), installs every archive
+# fresh on SQLite and probes it (the smoke job: a failure blocks publishing), and publishes the
 # archives as ONE GitHub pre-release with checksums and a build-provenance attestation.
-# The logic lives in .github/ionos/ionos-build-*.sh (tested by ionos-build.test.sh); see
-# .github/ionos/ionos-build.md.
+# The logic lives in .github/ionos/ionos-build-*.sh and ionos-smoke-*.sh (tested by ionos-build.test.sh
+# and ionos-smoke.test.sh); see .github/ionos/ionos-build.md.
 #
 # WHY ONE FILE FOR ALL BUILDS: GitHub's run_number counts per workflow file, and the build number of
 # every artifact (dev and, with a later ticket, release) is this run number: one counter, always
@@ -33,6 +34,11 @@ on:
         description: 'Build although nothing changed since the last dev pre-release (scheduled runs skip then)'
         type: boolean
         default: false
+      smoke_break:
+        description: 'Proof of the smoke gate: tamper with the archives before the smoke test, which must then fail and block publishing (manual runs only)'
+        type: choice
+        options: [none, missing-app, extra-app, wrong-mode]
+        default: none
 
 permissions:
   contents: read
@@ -147,10 +153,73 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+  smoke:
+    # Installs every archive on SQLite and probes it. Runs app code from the archives (php occ, cron.php and a
+    # web server on localhost): a read-only token and nothing else. Any failure fails this job, and publish
+    # needs it, so nothing is published. The logs are kept as a workflow artifact, also after a failure.
+    name: Fresh-install smoke test
+    needs: [plan, build]
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      # only a manual run can set smoke_break; scheduled runs always get none
+      SMOKE_BREAK: ${{ inputs.smoke_break || 'none' }}
+    steps:
+      - name: Set the work folder
+        run: echo "WORK=$RUNNER_TEMP/ionos-build" >> "$GITHUB_ENV"
+
+      # Only the scripts and the flavors repository (for `ncw resolve`), not the 7 GB server tree.
+      - name: Check out the scripts and the flavors repository
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          fetch-depth: 1
+          sparse-checkout: |
+            .github/ionos
+            IONOS
+          persist-credentials: false
+
+      - name: Check out the flavors repository
+        run: git submodule update --init --depth 1 -- IONOS
+
+      - name: Set up Node.js 24 for the tooling
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+
+      - name: Install the flavors tool
+        working-directory: IONOS/tools
+        run: npm ci --ignore-scripts
+
+      - name: Download the archives
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ionos-build
+          path: ${{ runner.temp }}/ionos-build
+
+      # Gate proof (manual runs only): the smoke test below must fail, and publish must be skipped.
+      - name: Tamper with the archives (smoke_break)
+        if: github.event_name == 'workflow_dispatch' && inputs.smoke_break != 'none'
+        run: bash .github/ionos/ionos-smoke-break.sh "$SMOKE_BREAK" "$WORK"/out/*.zip
+
+      - name: Install every archive and probe it
+        run: bash .github/ionos/ionos-smoke-run.sh
+
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ionos-smoke-logs
+          path: ${{ runner.temp }}/ionos-build/smoke-logs
+          if-no-files-found: ignore
+          retention-days: 14
+
   publish:
     # Runs no app code at all: only the scripts of this repository and the archives of the build job.
     name: Attest, publish and prune
-    needs: [plan, build]
+    needs: [plan, build, smoke]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
