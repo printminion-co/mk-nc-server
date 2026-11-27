@@ -111,6 +111,22 @@ pushed. All actions are GitHub's own and pinned to a commit SHA.
 - Upstream's central `dev-files.txt` list is not applied; the tool's dev file strip and `validate` cover
   `.git*`, `node_modules`, app tests and the like.
 
+## Apps that need attention (local build of all 27 pinned apps, Node 24, PHP 8.3, Composer 2.7)
+
+All 22 apps of `apps-upstream/` and the 5 of `apps-flavor1/` were built from their pins with the real
+`ionos-build-apps.sh`, real npm and composer, 4 at a time. Only these needed something:
+
+| App | Problem | Handling |
+| --- | --- | --- |
+| serverinfo, survey_client | handwritten tracked `js/` and `css/`, no `package.json`, no runtime packages | no-op recipe (`build-recipes/<app>.sh`) |
+| text, viewer, photos, privacy, files_pdfviewer, recommendations | `npm ci --ignore-scripts` breaks the build (vue-demi's postinstall) | default recipe runs `npm ci` with scripts |
+| password_policy | composer `post-install-cmd` runs `composer bin all install` (dev tooling) and fails | composer runs with `--no-scripts` |
+| calendar, groupfolders, notes, tasks | composer requires only php or the bin plugin; tracked handwritten `css/` | no recipe any more: composer is skipped without runtime packages, tracked files are never deleted |
+| files_downloadlimit, related_resources | tracked `css/public.css` is a build input; related_resources commits its built `js/` | tracked files are never deleted; the rebuild rewrites changed files, which is what the marker check sees |
+
+`engines` warnings (EBADENGINE, for example Node ^22 in some apps) are warnings only; no app broke on Node 24.
+What a local run cannot show: the runner's PHP is also 8.3, but its Composer version may differ.
+
 ## Open items
 
 - The design says an app recipe override is a `build:` entry in the flavor manifest. The tool does not
