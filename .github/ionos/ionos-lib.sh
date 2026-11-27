@@ -95,3 +95,25 @@ disable_upstream_workflows() {
   done <<<"$list"
   return "$failed"
 }
+
+# ---- smoke test (ionos-smoke-*.sh)
+
+# The apps of `ncw resolve` output <file> as "<id> <mode>" lines (the `apps:` section, "  id: mode").
+resolved_apps() {
+  awk '/^[A-Za-z_]+:/ { sec = $1; sub(/:$/, "", sec); next }
+       sec == "apps" && /^  [^ ]/ { id = $1; sub(/:$/, "", id); print id, $2 }' "$1"
+}
+
+# The declared environment variables of `ncw resolve` output <file> as "<name><TAB><required><TAB><default>" lines
+# (the `env:` section, a list of maps; quotes around a value are dropped; `env: []` gives nothing).
+resolved_env() {
+  awk -v OFS='\t' '
+    function flush() { if (name != "") print name, req, def; name = ""; req = "false"; def = "" }
+    function val(s) { sub(/^[^:]*: */, "", s); if (s ~ /^".*"$/ || s ~ /^'\''.*'\''$/) s = substr(s, 2, length(s) - 2); return s }
+    /^[A-Za-z_]+:/ { flush(); sec = $1; sub(/:$/, "", sec); next }
+    sec != "env" { next }
+    /^  - name:/ { flush(); name = val($0); req = "false"; def = ""; next }
+    /^    required:/ { req = val($0); next }
+    /^    default:/ { def = val($0); next }
+    END { flush() }' "$1"
+}

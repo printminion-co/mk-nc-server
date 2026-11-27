@@ -1,0 +1,9 @@
+# Allow-list of the fresh-install smoke test (ionos-smoke-logs.sh).
+#
+# Entries of data/nextcloud.log at level error (3) or higher fail the smoke test unless their message matches a
+# line of this file. One extended regular expression (grep -E) per line, applied to the message. EVERY entry needs
+# a comment line above it that says which message it is, where it comes from and why it is harmless. Keep the list
+# short: an entry hides a real problem as soon as it is wider than the one message. Empty lines and lines starting
+# with # are ignored. A "Disabled incompatible app" line fails the smoke test whatever this file says.
+#
+# (none yet)
