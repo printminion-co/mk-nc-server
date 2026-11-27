@@ -55,6 +55,16 @@ if [[ $endpoint == *\?* ]]; then
   IFS='&' read -ra kv <<<"${endpoint#*\?}"
   for p in "${kv[@]}"; do F["${p%%=*}"]="${p#*=}"; done
 fi
+# The organization rule: nextcloud/* and nextcloud-releases/* reject the sync token (STUB_ORG_REJECT holds its value)
+if [ -n "${STUB_ORG_REJECT:-}" ] && [ "${GH_TOKEN:-}" = "$STUB_ORG_REJECT" ] && [[ $path == repos/nextcloud/* || $path == repos/nextcloud-releases/* ]]; then
+  echo '{"message":"The nextcloud organization forbids access via a fine-grained personal access tokens if the token'"'"'s lifetime is greater than 366 days."}'
+  echo "gh: The 'nextcloud' organization forbids access via a fine-grained personal access tokens if the token's lifetime is greater than 366 days. (HTTP 403)" >&2
+  exit 1
+fi
+# STUB_HTTP=<part of an endpoint>=<code>: any call whose path contains the part fails with that code
+if [ -n "${STUB_HTTP:-}" ] && [[ $path == *"${STUB_HTTP%%=*}"* ]]; then
+  echo '{"message":"stub failure"}'; echo "gh: stub failure (HTTP ${STUB_HTTP#*=})" >&2; exit 1
+fi
 n=$(( $(find "$STUB_DIR/log" -name 'call.*' | wc -l) + 1 ))
 echo "$method $endpoint" >"$STUB_DIR/log/call.$n"   # debugging aid only; tests assert on state
 body=""
@@ -406,6 +416,49 @@ test_missing_app_tag_fails_without_partial_change() {
   assert_eq "nothing was created" "$(written)" 0
 }
 
+test_upstream_reads_use_the_read_token() {
+  echo "the org rejects the sync token for nextcloud/*: upstream reads use READ_TOKEN, fork writes keep GH_TOKEN"
+  scenario
+  run_script STUB_ORG_REJECT=x READ_TOKEN=default
+  assert_eq "exit code" "$RC" 0
+  assert_eq "one pull request" "$(pulls | wc -l)" 1
+  scenario
+  run_script STUB_ORG_REJECT=x
+  assert_fails "without a read token the rejected token is used and the run fails"
+  assert_contains "the failure shows gh's message" "$OUT" "forbids access"
+  assert_not_contains "and not the misleading text" "$OUT" "does not tag every"
+  assert_not_contains "nor the misleading ancestor text" "$OUT" "is an ancestor"
+  assert_eq "nothing was created" "$(written)" 0
+}
+
+test_error_messages_say_what_failed() {
+  echo "a genuine 404 says the tag is missing; any other failure shows gh's message"
+  scenario
+  rm "$T/fx/repos_nextcloud_b_two_git_ref_tags_v33.0.10"
+  run_script
+  assert_contains "404: tag not found in the repository" "$OUT" "tag v33.0.10 not found in nextcloud/b_two (app b_two)"
+  scenario
+  run_script STUB_HTTP=b_two/git/ref/tags=500
+  assert_fails "500 fails"
+  assert_contains "500: cannot read tag" "$OUT" "cannot read tag v33.0.10 of nextcloud/b_two"
+  assert_contains "500: gh's message is shown" "$OUT" "stub failure (HTTP 500)"
+  assert_not_contains "500 is not reported as a missing tag" "$OUT" "not found"
+  scenario
+  run_script STUB_HTTP=/compare/=500
+  assert_fails "a failing compare fails"
+  assert_contains "compare: clear message with gh's text" "$OUT" "cannot compare"
+  assert_contains "compare: gh's message is shown" "$OUT" "stub failure (HTTP 500)"
+  scenario
+  run_script STUB_HTTP=matching-refs=500
+  assert_fails "a failing tag listing fails"
+  assert_contains "tag listing: clear message" "$OUT" "cannot list the tags of nextcloud/server"
+  assert_contains "tag listing: gh's message is shown" "$OUT" "stub failure (HTTP 500)"
+  scenario
+  run_script STUB_HTTP=stable33.json=500
+  assert_contains "app list: clear message" "$OUT" "cannot read the app list"
+  assert_contains "app list: gh's message is shown" "$OUT" "stub failure (HTTP 500)"
+}
+
 test_app_set_change_updates_gitmodules() {
   echo "app set changed: .gitmodules is part of the commit, removed app dropped"
   scenario
@@ -480,7 +533,7 @@ test_token_warning() {
   assert_not_contains "no warning with the secret" "$OUT" "IONOS_SYNC_TOKEN"
 }
 
-for t in test_pins_differ_opens_one_pull_request test_base_is_the_release_of_the_dev_branch \
+for t in test_upstream_reads_use_the_read_token test_error_messages_say_what_failed test_pins_differ_opens_one_pull_request test_base_is_the_release_of_the_dev_branch \
   test_base_moves_after_promotion test_no_ancestor_tag_fails test_pins_equal_does_nothing \
   test_second_run_is_idempotent test_existing_branch_with_same_pins_does_nothing \
   test_existing_branch_with_stale_pins_is_refreshed test_branch_moved_meanwhile_is_not_overwritten test_existing_branch_with_open_pull_request_is_left \

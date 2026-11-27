@@ -54,6 +54,9 @@ jobs:
       - name: Propose pins
         env:
           GH_TOKEN: ${{ secrets.IONOS_SYNC_TOKEN || github.token }}
+          # public upstream data is read with the default token: the nextcloud organization rejects
+          # fine-grained tokens with a lifetime over 366 days
+          READ_TOKEN: ${{ github.token }}
           HAS_SYNC_TOKEN: ${{ secrets.IONOS_SYNC_TOKEN != '' }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           DRY_RUN: ${{ inputs.dry_run }}

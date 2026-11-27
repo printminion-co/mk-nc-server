@@ -124,6 +124,12 @@ meanwhile (a best-effort lease).
 anything else stops the run. Branch names and refs are passed as query parameters, not concatenated
 into URLs.
 
+**Two tokens.** Public upstream data (`nextcloud/*`, `nextcloud-releases/*`: tags, the app list, tag objects)
+is read with `READ_TOKEN`, which the workflow sets to the default `GITHUB_TOKEN` (the script falls back to
+`GH_TOKEN` when it is unset, for local use). The `nextcloud` organization forbids fine-grained personal access
+tokens with a lifetime over 366 days (HTTP 403 for every call), and the sync token is such a token. Only
+operations on the fork use `GH_TOKEN`. Errors show gh's message; "tag ... not found" is said only for a real HTTP 404.
+
 **The token.** The helper opens its pull request with the repository secret `IONOS_SYNC_TOKEN`, see
 `ionos-sync.md` for what the token is and how to create it. Pull requests opened with the default
 `GITHUB_TOKEN` do not trigger workflows, so the commit-lint check would not run on them; without the
