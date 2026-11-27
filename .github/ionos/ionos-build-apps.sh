@@ -2,8 +2,9 @@
 # Builds every out-of-tree app of $WORK/apps-all.txt from source. A submodule is initialised shallowly
 # (only these, never all). The recipe is the script .github/ionos/build-recipes/<app id>.sh when it
 # exists (run with the app folder as the current folder and APP set), else the default:
-#   composer install --no-dev -a        when composer.json exists
-#   npm ci --ignore-scripts && npm run build   when package.json has a build script
+#   composer install --no-dev -a --no-scripts   when composer.json has runtime packages
+#   npm ci && npm run build                     when package.json has a build script (lifecycle scripts run:
+#                                               vue-demi's postinstall is needed by text, viewer, photos)
 # with the checks of default_recipe below: committed built files are deleted first and the build must
 # produce new ones. Needs jq.
 #
@@ -26,17 +27,21 @@ read -r -a COMPOSER_CMD <<<"${COMPOSER:-composer}"
 #  - an app with committed js/ or css/ files, no package.json build script and no recipe is an error: it
 #    cannot be rebuilt from source here (add .github/ionos/build-recipes/<app>.sh, even a no-op one that
 #    says the files are sources);
-#  - composer.json: untracked and ignored files of vendor/ are removed, `composer install --no-dev -a` runs
+#  - composer.json with runtime packages (anything but php, ext-* and bamarni/*): untracked and ignored files
+#    of vendor/ are removed, `composer install --no-dev -a --no-scripts` runs (post-install-cmd is dev tooling)
 #    and vendor/autoload.php must exist;
 #  - a package.json build script: untracked and ignored files of js/ and css/ are removed, a marker is
-#    taken, `npm ci --ignore-scripts && npm run build` runs, and the build must have written at least one
+#    taken, `npm ci && npm run build` runs, and the build must have written at least one
 #    file newer than the marker in js/ or css/ (so a build that writes nothing fails);
 #  - node_modules is deleted afterwards.
 # Every command ends in `|| return 1`: this runs under `||` in the caller, where `set -e` does nothing.
 # Messages are plain lines naming the app; the one ::error:: of the step lists all failing apps.
 default_recipe() {
   local has_composer=false has_build=false marker
-  [ -f composer.json ] && has_composer=true
+  # like upstream's release build: composer only when there are runtime packages (not php, ext-* or the bin plugin)
+  if [ -f composer.json ] && jq -e '.require // {} | keys | map(select(. != "php" and (startswith("ext-") | not) and (startswith("bamarni/") | not))) | length > 0' composer.json >/dev/null; then
+    has_composer=true
+  fi
   if [ -f package.json ] && jq -e '.scripts.build' package.json >/dev/null; then has_build=true; fi
 
   if [ "$has_build" = false ] && [ -n "$(git ls-files -- js css | head -n1)" ]; then
@@ -45,12 +50,12 @@ default_recipe() {
   fi
   if [ "$has_composer" = true ]; then
     git clean -fdxq -- vendor || return 1
-    "${COMPOSER_CMD[@]}" install --no-dev -a --no-interaction --quiet || return 1
+    "${COMPOSER_CMD[@]}" install --no-dev -a --no-scripts --no-interaction --quiet || return 1
     [ -f vendor/autoload.php ] || { echo "ionos-build: $APP has a composer.json but composer install produced no vendor/autoload.php" >&2; return 1; }
   fi
   if [ "$has_build" = true ]; then
     git clean -fdxq -- js css || return 1
-    "${NPM_CMD[@]}" ci --ignore-scripts || return 1
+    "${NPM_CMD[@]}" ci || return 1
     marker=$(mktemp) || return 1
     sleep 1
     "${NPM_CMD[@]}" run build || { rm -f "$marker"; return 1; }

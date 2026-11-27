@@ -374,6 +374,7 @@ mkapp() {
     composer) echo '{"require":{"x/y":"1"}}' > "$d/composer.json" ;;
     plainjs) echo '{"name":"no-build-script"}' > "$d/package.json" ;;
     static) ;;
+    devonly) echo '{"require":{"php":">=8.1","ext-json":"*","bamarni/composer-bin-plugin":"^1.8"}}' > "$d/composer.json"; echo '{"scripts":{"build":"x"}}' > "$d/package.json" ;;
   esac
   # committed built output, which must never be trusted
   case "$kind" in both|composer) mkdir -p "$d/vendor"; echo stale > "$d/vendor/stale.php" ;; esac
@@ -517,7 +518,8 @@ sc_apps() {
   run_build a1 ionos-build-apps.sh NPM_OUT=second
   check "default recipe: untracked leftovers of an earlier build are removed before the next" test ! -e "$r/apps-x/a/js/built.js" -a -f "$r/apps-x/a/js/second.js"
   check "default recipe: a second build still keeps the tracked files" test -f "$r/apps-x/a/js/stale.js" -a -f "$r/apps-x/a/css/hand.css"
-  check "default recipe: npm ci runs with --ignore-scripts" grep -q 'apps-x/a: npm-stub ci --ignore-scripts' "$ROOT/a1/cmd.log"
+  check "default recipe: npm ci runs lifecycle scripts (vue-demi's postinstall is needed by text, viewer, photos)" grep -q 'apps-x/a: npm-stub ci$' "$ROOT/a1/cmd.log"
+  check "default recipe: composer runs without scripts (post-install-cmd runs dev tooling)" grep -q 'apps-x/a: composer-stub install --no-dev -a --no-scripts' "$ROOT/a1/cmd.log"
   check "default recipe: node_modules is deleted afterwards" test ! -e "$r/apps-x/a/node_modules"
   check "a recipe in build-recipes replaces the default for that app" test -f "$r/apps-x/b/recipe-ran"
   check "the recipe knows the app id" grep -q 'recipe for b' "$r/apps-x/b/recipe-ran"
@@ -553,6 +555,9 @@ sc_apps() {
   run_build a10 ionos-build-select.sh; run_build a10 ionos-build-apps.sh
   check "an app with committed js/ and no build script is fine with a recipe" test "$(status a10)" = 0
 
+  mkapp cx devonly; fork a12 cx; run_build a12 ionos-build-select.sh; run_build a12 ionos-build-apps.sh
+  check "a composer.json that requires only php, extensions and the bin plugin has nothing to install: composer is not run" test "$(status a12)" = 0 -a "$(grep -c 'apps-x/cx: composer' "$ROOT/a12/cmd.log")" = 0
+  check "and such an app is still built with npm" test -f "$ROOT/a12/repo/apps-x/cx/js/built.js"
   # every app is tried; ONE error lists all failing apps
   mkapp cg both
   fork a11 ca cb cg; run_build a11 ionos-build-select.sh; run_build a11 ionos-build-apps.sh COMPOSER_NOBUILD=ca NPM_NOBUILD=cb
@@ -668,57 +673,23 @@ sc_package() {
   check "a bad build number is refused" test "$(status k3)" != 0
 }
 
-# The real recipes of .github/ionos/build-recipes, run against small stand-ins of the app trees with the stubs
-# (npm and composer are the heavy-stub; the recipes take them from $NPM and $COMPOSER like the default recipe).
-recipe_app() { # recipe_app <name> <app id> [tracked files...]: an app folder in a git repo with stale committed built output
-  local d="$ROOT/$1/$2"; rm -rf "$d"; mkdir -p "$d/js" "$d/css" "$d/vendor"
-  git init -q "$d"; echo stale > "$d/js/stale.js"; echo stale > "$d/vendor/stale.php"
-  echo '{"scripts":{"build":"x"}}' > "$d/package.json"; echo '{}' > "$d/composer.json"
-  local f; for f in "${@:3}"; do echo hand > "$d/$f"; done
-  git -C "$d" add -A -f; git -C "$d" commit -q -m app
-}
-run_recipe() { # run_recipe <name> <app id> [VAR=value ...]
-  local d="$ROOT/$1/$2" n="$1" id="$2"; shift 2; : > "$ROOT/$n/cmd.log"
-  ( cd "$d" && env APP="$id" NPM="$ROOT/bin/npm-stub" COMPOSER="$ROOT/bin/composer-stub" CMD_LOG="$ROOT/$n/cmd.log" CMD_BASE="$ROOT/$n" "$@" \
-      bash "$HERE/build-recipes/$id.sh" ) > "$ROOT/$n/out.log" 2>&1
-  echo $? > "$ROOT/$n/status"
-}
+# The real recipes of .github/ionos/build-recipes (see the table in ionos-build.md). Apps without a recipe use the
+# default recipe, checked above; a real run over every pinned app was done by hand (the table says so).
 sc_recipes() {
   local id d
-  for id in calendar groupfolders notes tasks; do
-    check "$id has a recipe" test -f "$HERE/build-recipes/$id.sh"
+  for id in calendar groupfolders notes tasks contacts; do
+    check "$id builds with the default recipe (no recipe file)" test ! -e "$HERE/build-recipes/$id.sh"
   done
-  check "contacts builds with the default recipe (it has no recipe)" test ! -e "$HERE/build-recipes/contacts.sh"
-
   mkdir -p "$ROOT/rc"
-  for id in calendar groupfolders; do
-    recipe_app rc "$id"; run_recipe rc "$id"; d="$ROOT/rc/$id"
-    check "$id: recipe succeeds" test "$(status rc)" = 0
-    check "$id: committed js/ is replaced by the build" test ! -e "$d/js/stale.js" -a -f "$d/js/built.js"
-    check "$id: npm ci runs with --ignore-scripts" grep -q "$id: npm-stub ci --ignore-scripts" "$ROOT/rc/cmd.log"
-    check "$id: node_modules is deleted afterwards" test ! -e "$d/node_modules"
-  done
-  recipe_app rc calendar; run_recipe rc calendar
-  check "calendar: composer runs without dev packages and without scripts (post-install-cmd runs composer bin)" \
-    grep -q 'calendar: composer-stub install --no-dev .*--no-scripts' "$ROOT/rc/cmd.log"
-  recipe_app rc groupfolders; run_recipe rc groupfolders
-  check "groupfolders: composer is not run (no runtime packages)" test "$(grep -c composer-stub "$ROOT/rc/cmd.log")" = 0
-
-  for id in notes tasks; do
-    recipe_app rc "$id" "css/hand-$id.css"; run_recipe rc "$id"; d="$ROOT/rc/$id"
-    check "$id: recipe succeeds" test "$(status rc)" = 0
-    check "$id: committed js/ is replaced by the build" test ! -e "$d/js/stale.js" -a -f "$d/js/built.js"
-    check "$id: the handwritten css/ file survives" test "$(cat "$d/css/hand-$id.css")" = hand
-    check "$id: npm ci runs with --ignore-scripts" grep -q "$id: npm-stub ci --ignore-scripts" "$ROOT/rc/cmd.log"
-    check "$id: node_modules is deleted afterwards" test ! -e "$d/node_modules"
-  done
-  recipe_app rc tasks css/hand-tasks.css; echo built > "$ROOT/rc/tasks/css/built.css"; echo changed > "$ROOT/rc/tasks/css/hand-tasks.css"
-  run_recipe rc tasks
-  check "tasks: an untracked built css file is removed and a changed tracked one restored" \
-    test ! -e "$ROOT/rc/tasks/css/built.css" -a "$(cat "$ROOT/rc/tasks/css/hand-tasks.css")" = hand
-  for id in calendar groupfolders notes tasks; do
-    recipe_app rc "$id"; run_recipe rc "$id" NPM_NOBUILD="$id"
-    check "$id: a build that produces nothing fails" test "$(status rc)" != 0
+  for id in serverinfo survey_client; do
+    check "$id has a recipe" test -f "$HERE/build-recipes/$id.sh"
+    d="$ROOT/rc/$id"; rm -rf "$d"; mkdir -p "$d/js" "$d/css"; git init -q "$d"
+    echo src > "$d/js/script.js"; echo src > "$d/css/style.css"; echo '{"require":null}' > "$d/composer.json"
+    git -C "$d" add -A; git -C "$d" commit -q -m app
+    : > "$ROOT/rc/cmd.log"
+    ( cd "$d" && env APP="$id" NPM="$ROOT/bin/npm-stub" COMPOSER="$ROOT/bin/composer-stub" CMD_LOG="$ROOT/rc/cmd.log" CMD_BASE="$ROOT/rc" bash "$HERE/build-recipes/$id.sh" ) > "$ROOT/rc/out.log" 2>&1
+    check "$id: the recipe succeeds and leaves the handwritten js/ and css/ alone" test "$?" = 0 -a "$(cat "$d/js/script.js")" = src -a "$(cat "$d/css/style.css")" = src
+    check "$id: the recipe runs no npm and no composer" test ! -s "$ROOT/rc/cmd.log"
   done
 }
 
