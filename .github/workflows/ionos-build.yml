@@ -37,7 +37,7 @@ on:
       smoke_break:
         description: 'Proof of the smoke gate: tamper with the archives before the smoke test, which must then fail and block publishing (manual runs only)'
         type: choice
-        options: [none, missing-app, extra-app, wrong-mode]
+        options: [none, missing-app, extra-app, wrong-mode, skip-enable]
         default: none
 
 permissions:

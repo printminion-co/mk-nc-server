@@ -121,9 +121,11 @@ For every archive in `out/`:
 3. Variables the flavor declares (`env:` of the resolved output): a required one gets the test value
    `smoke-test-value-<name>`, an optional one its declared default.
 4. `php occ maintenance:install --database sqlite` with a test admin, as the deployment contract says.
-5. The deployment's next step, `ionos-smoke-appconfig.sh`: `${VAR}` placeholders of `app-config.json` are filled from the
-   environment (a missing one fails), then `occ config:import`; each entry of `app-config-special.json` is set with
-   `occ config:app:set --value ... [--type] [--lazy] [--sensitive]`.
+5. The deployment's next step: `bash ncw-configure.sh`, the script the flavors tool generated into the archive (run in
+   the tree with `PHP` set; it fills the `${VAR}` placeholders of `app-config.json` from the environment, runs
+   `occ config:import`, sets `app-config-special.json` with `occ config:app:set`, and enables the apps of the flavor's
+   `enable_after_install` with `occ app:enable`). An archive without the script fails before the install. The smoke
+   test has no configuration code of its own.
 6. `php -S 127.0.0.1:<port> -t <tree>` (4 workers, no router: the probes use `index.php`, `remote.php` and `ocs/v2.php`
    paths), then `ionos-smoke-probes.sh`: `status.php`, login page, OCS capabilities (basic auth, `OCS-APIRequest`), WebDAV
    PROPFIND, PUT and GET with a content compare, a session through the login form (cookie jar, request token and an
@@ -131,11 +133,13 @@ For every archive in `out/`:
    each failure is named.
 7. `php cron.php` and `occ files:scan --all`.
 8. `occ app:list --output=json_pretty` against the resolved flavor (`ionos-smoke-apps.sh`): `always` and `default` apps
-   enabled, `available` apps present and disabled, `removed` apps absent, and an app the flavor does not list is an error.
-   Each problem names the app and the mode. How `default` apps get enabled: nothing extra is done. `occ maintenance:install`
-   itself installs and enables every app listed in `alwaysEnabled` or `defaultEnabled` of `core/shipped.json`, in any app
-   folder, including added apps that are not in `shippedApps` (the spec says `default` means "enabled at install"). The smoke
-   test deliberately runs no `occ app:enable`: it would hide a wrong `shipped.json`.
+   enabled, `available` apps present and disabled, except the ones in `enable_after_install` (listed by `ncw resolve`),
+   which must be enabled, `removed` apps absent, and an app the flavor does not list is an error. Each problem names the
+   app and the mode. How apps get enabled: `occ maintenance:install` itself installs and enables every app listed in
+   `alwaysEnabled` or `defaultEnabled` of `core/shipped.json`, in any app folder, including added apps that are not in
+   `shippedApps`. An app the installer cannot enable (groupfolders: its migration needs the app loaded) is `available`
+   and listed in `enable_after_install`, and `ncw-configure.sh` enables it. The smoke test runs no `occ app:enable`
+   itself: it would hide a wrong `shipped.json`.
 9. `data/nextcloud.log` (`ionos-smoke-logs.sh`): fails on every entry at level 3 (error) or higher whose message does not match
    `ionos-smoke-log-allowlist.txt`, on a line that is not JSON, and ALWAYS on a `Disabled incompatible app` line (at any
    level, whatever the allow-list says).
@@ -156,7 +160,7 @@ comes from and why it is harmless. A blank entry or an invalid expression fails 
 ### Reading the logs
 
 The artifact `ionos-smoke-logs` of the run (kept 14 days, also after a failure) has one folder per flavor: `resolved.yaml`,
-`install.log`, `appconfig.log`, `php-server.log` (web server access and error log), `probes.log` and `probes/` (every
+`install.log`, `configure.log`, `php-server.log` (web server access and error log), `probes.log` and `probes/` (every
 answer), `cron.log`, `scan.log`, `app-list.json`, `apps.log`, `nextcloud.log` (the JSON lines) and `logs.log` (the verdict).
 Start with the `::error::` lines of the job; they name the app or the log entry. Open `nextcloud.log` with
 `jq -r 'select(.level >= 3) | [.level, .app, .message] | @tsv'`.
@@ -171,6 +175,7 @@ A manual run of `IONOS build` with input `smoke_break` set to one of these tampe
 | `missing-app` | deletes the folder of one app that a fresh install enables (the last `defaultEnabled` app that has a folder) | `app '<id>' has mode default but is not in the app list` |
 | `extra-app` | adds a valid app folder `apps/ionos_smoke_extra` | `app 'ionos_smoke_extra' is disabled but is not in the resolved flavor` |
 | `wrong-mode` | takes one `defaultEnabled` app out of `core/shipped.json` | `app '<id>' has mode default and must be enabled ... but it is disabled` |
+| `skip-enable` | empties the `ENABLE_APPS` list of the archive's `ncw-configure.sh` (needs a flavor with `enable_after_install`) | `app '<id>' has mode available and is listed in enable_after_install: it must be enabled ...` |
 
 If the smoke test passes with a break, the run fails with "did not catch the break" (so a gate that proves nothing is a
 failure too). Scheduled runs have no such input and always use `none`; the tamper step also only runs for `workflow_dispatch`.
@@ -178,20 +183,16 @@ Combine with `flavors` to keep the proof short. A run with a break must show: sm
 
 ### What the first runs on dev-v33.0.9.5 showed
 
-Run on the published archive `ncw-flavor1-v33.0.9.5.zip` (server commit 9538551), the smoke test FAILS at the install, so
-the gate does what it is for. Two real defects, both found by reading the install output:
+Run on the published archive `ncw-flavor1-v33.0.9.5.zip` (server commit 9538551), the smoke test failed at the install, so
+the gate did what it is for. Two real defects were found by reading the install output:
 
-- `calendar` and `contacts` have no `vendor/autoload.php` (their `composer/autoload.php` requires it), because the app
-  build used to skip composer when `composer.json` has no runtime packages (fixed: composer now always runs, see the default recipe). `occ maintenance:install` died with "Failed opening
-  required .../vendor/autoload.php". Composer must run for these apps (the autoloader is needed even without packages).
-- `groupfolders` is `default` in flavor1, so `occ maintenance:install` installs it, and its migration needs a service
-  that the app registers when it is loaded (`IUserMappingManager`, bound in `Application::register`); the install dies with
-  "Could not resolve OCA\GroupFolders\ACL\UserMapping\IUserMappingManager". `occ app:enable groupfolders` on an installed
-  instance works. So a fresh install cannot enable groupfolders at install time; until that is decided in the flavors
-  repository (for example mode `available` plus an explicit enable step in the deployment), the smoke test of flavor1 stays red.
-
-With those two repaired in a local copy (vendor folders added, groupfolders `available` in a copy of the flavors folder) the
-smoke test passes on the real archive, and the three `smoke_break` modes each fail it.
+- `calendar` and `contacts` had no `vendor/autoload.php` (their `composer/autoload.php` requires it), because the app
+  build skipped composer when `composer.json` had no runtime packages. Fixed: composer now always runs (see the default recipe).
+- `groupfolders` was `default` in flavor1, so `occ maintenance:install` installed it, and its migration needs a service
+  that the app registers when it is loaded (`IUserMappingManager`, bound in `Application::register`); the install died with
+  "Could not resolve OCA\\GroupFolders\\ACL\\UserMapping\\IUserMappingManager". `occ app:enable groupfolders` on an installed
+  instance works. Decision: groupfolders is `available` plus `enable_after_install: [groupfolders]` in the flavor, and
+  `ncw-configure.sh` enables it. This needs the flavors commits that add the field and the script (pin bump).
 
 ## Differences from upstream's release build
 

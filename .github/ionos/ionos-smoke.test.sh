@@ -68,6 +68,10 @@ applist '.enabled.firstrunwizard = "3.0.0"' removed-enabled
 applist '.disabled.firstrunwizard = "3.0.0"' removed-disabled
 applist '.disabled.files = .enabled.files | del(.enabled.files)' always-disabled
 echo 'not json' > "$FIX/applist-bad.json"
+# a flavor that enables the available app talk after the install (ncw-configure.sh)
+sed 's/^app_folders:/enable_after_install:\n  - talk\napp_folders:/' "$FIX/resolved.yaml" > "$FIX/resolved-enable.yaml"
+applist '.enabled.talk = .disabled.talk | del(.disabled.talk)' talk-enabled
+applist '.enabled.talk = .disabled.talk | del(.disabled.talk) | del(.enabled.contacts)' talk-enabled-missing
 
 # a log line of Nextcloud's JSON log
 logline() { # logline <level> <message> [app]
@@ -127,6 +131,15 @@ sc_apps() {
   run a7 bash "$HERE/ionos-smoke-apps.sh" "$FIX/applist-ok.json"
   check "missing arguments fail" test "$(status a7)" != 0
 
+  # enable_after_install: the app is mode available, and must be enabled after the script
+  run a9 bash "$HERE/ionos-smoke-apps.sh" "$FIX/applist-talk-enabled.json" "$FIX/resolved-enable.yaml"
+  check "an enable_after_install app that is enabled passes" test "$(status a9)" = 0
+  run a9 bash "$HERE/ionos-smoke-apps.sh" "$FIX/applist-ok.json" "$FIX/resolved-enable.yaml"
+  check "an enable_after_install app that is still disabled fails" test "$(status a9)" != 0
+  check "the failure names the app and says it must be enabled" said_re a9 "'talk'.*enable_after_install.*must be enabled"
+  run a9 bash "$HERE/ionos-smoke-apps.sh" "$FIX/applist-talk-enabled.json" "$FIX/resolved.yaml"
+  check "without enable_after_install an available app that is enabled still fails" test "$(status a9)" != 0
+  check "enable_after_install: [] in the resolved flavor means none" bash -c "sed 's/^app_folders:/enable_after_install: []\napp_folders:/' '$FIX/resolved.yaml' > '$FIX/resolved-empty-enable.yaml' && bash '$HERE/ionos-smoke-apps.sh' '$FIX/applist-ok.json' '$FIX/resolved-empty-enable.yaml'"
   jq -c '.enabled.zzz = "1" | del(.enabled.contacts)' "$FIX/applist-ok.json" > "$FIX/applist-two.json"
   run a8 bash "$HERE/ionos-smoke-apps.sh" "$FIX/applist-two.json" "$FIX/resolved.yaml"
   check "every problem is reported, not only the first" bash -c "grep -q \"'contacts'\" '$ROOT/a8.log' && grep -q \"'zzz'\" '$ROOT/a8.log'"
@@ -248,6 +261,22 @@ sc_break() {
   check "a missing archive fails" test "$(status b4)" != 0
   run b4 bash "$HERE/ionos-smoke-break.sh" missing-app
   check "missing arguments fail" test "$(status b4)" != 0
+  # skip-enable: the script keeps its other lines, only the list of apps to enable is emptied
+  mkzip "$z"
+  cat > "$ROOT/zipsrc/ncw-configure.sh" <<'SCRIPT'
+#!/usr/bin/env bash
+ENABLE_APPS=('groupfolders' 'x')
+app:enable "${ENABLE_APPS[@]}"
+SCRIPT
+  ( cd "$ROOT/zipsrc" && zip -q "$z" ncw-configure.sh )
+  run b9 bash "$HERE/ionos-smoke-break.sh" skip-enable "$z"
+  check "skip-enable empties ENABLE_APPS and keeps the rest of the script" bash -c "test '$(status b9)' = 0 && unzip -p '$z' ncw-configure.sh | grep -qx 'ENABLE_APPS=()' && unzip -p '$z' ncw-configure.sh | grep -q 'app:enable' && ! unzip -p '$z' ncw-configure.sh | grep -q groupfolders"
+  mkzip "$z"
+  run b9 bash "$HERE/ionos-smoke-break.sh" skip-enable "$z"
+  check "skip-enable fails when the archive has no script" test "$(status b9)" != 0
+  printf '#!/usr/bin/env bash\nENABLE_APPS=()\n' > "$ROOT/zipsrc/ncw-configure.sh"; ( cd "$ROOT/zipsrc" && zip -q "$z" ncw-configure.sh )
+  run b9 bash "$HERE/ionos-smoke-break.sh" skip-enable "$z"
+  check "skip-enable fails when the script enables no app (nothing to prove)" test "$(status b9)" != 0
   # an archive whose shipped.json lists no default app (nothing to break)
   local d="$ROOT/zipnone"; rm -rf "$d"; mkdir -p "$d/core" "$d/apps/files/appinfo"; echo '{"defaultEnabled":[]}' > "$d/core/shipped.json"; echo '<info/>' > "$d/apps/files/appinfo/info.xml"
   ( cd "$d" && zip -qr "$ROOT/none.zip" . )
@@ -270,54 +299,6 @@ sc_break() {
   ( cd "$ROOT" && mkdir -p oddroot/core && cp odd.json oddroot/core/shipped.json && cd oddroot && zip -q "$z" core/shipped.json )
   run b7 bash "$HERE/ionos-smoke-break.sh" missing-app "$z"
   check "an odd app id in shipped.json is ignored, not used as a pattern" bash -c "test '$(status b7)' = 0 && unzip -Z1 '$z' | grep -q '^apps/files/'"
-}
-
-# ---------------------------------------------------------------- scenario: appconfig
-sc_appconfig() {
-  local t="$ROOT/ac"; rm -rf "$t"; mkdir -p "$t"
-  cat > "$ROOT/occ-stub" <<'STUB'
-#!/usr/bin/env bash
-# stub for `php occ`: records the arguments, and for config:import also the file it was given
-echo "occ $*" >> "$OCC_LOG"
-if [ "$1" = config:import ]; then cp "$2" "$OCC_LOG.import"; fi
-[ "${OCC_FAIL:-}" != "$1" ] || { echo "occ: $1 failed" >&2; exit 1; }
-STUB
-  chmod +x "$ROOT/occ-stub"
-  cat > "$t/app-config.json" <<'EOF'
-{"apps":{"theming":{"name":"Demo","url":"${BASE_URL}/x"}}}
-EOF
-  cat > "$t/app-config-special.json" <<'EOF'
-[
-  {"app":"mail","key":"smtp_pass","value":"${SMTP_PASSWORD}","sensitive":true},
-  {"app":"demo","key":"count","value":"3","type":"integer","lazy":true}
-]
-EOF
-  : > "$ROOT/occ.log"
-  run c1 env OCC="$ROOT/occ-stub" OCC_LOG="$ROOT/occ.log" BASE_URL=https://demo.example SMTP_PASSWORD=s3cret bash "$HERE/ionos-smoke-appconfig.sh" "$t" "$t-tmp"
-  check "the app config step succeeds" test "$(status c1)" = 0
-  check "app-config.json is imported" grep -q '^occ config:import ' "$ROOT/occ.log"
-  check "the placeholders of app-config.json are filled from the environment" grep -q 'https://demo.example/x' "$ROOT/occ.log.import"
-  check "the imported file has no placeholder left" bash -c "! grep -q '\${' '$ROOT/occ.log.import'"
-  check "a sensitive special setting is set with --sensitive and the filled value" grep -q '^occ config:app:set mail smtp_pass --value=s3cret --sensitive' "$ROOT/occ.log"
-  check "a lazy typed special setting is set with --lazy and --type" grep -q '^occ config:app:set demo count --value=3 --type=integer --lazy' "$ROOT/occ.log"
-  check "the secret does not appear in the step's output" bash -c "! grep -q s3cret '$ROOT/c1.log'"
-
-  : > "$ROOT/occ.log"
-  run c2 env OCC="$ROOT/occ-stub" OCC_LOG="$ROOT/occ.log" SMTP_PASSWORD=s3cret bash "$HERE/ionos-smoke-appconfig.sh" "$t" "$t-tmp"
-  check "a placeholder without a value fails (never imports a literal placeholder)" test "$(status c2)" != 0
-  check "the missing variable is named" said c2 BASE_URL
-  check "nothing is imported when a variable is missing" bash -c "! grep -q config:import '$ROOT/occ.log'"
-
-  : > "$ROOT/occ.log"
-  run c3 env OCC="$ROOT/occ-stub" OCC_LOG="$ROOT/occ.log" OCC_FAIL=config:import BASE_URL=u SMTP_PASSWORD=p bash "$HERE/ionos-smoke-appconfig.sh" "$t" "$t-tmp"
-  check "a failing import fails the step" test "$(status c3)" != 0
-
-  local e="$ROOT/ac2"; mkdir -p "$e"; echo '{"apps":{}}' > "$e/app-config.json"; echo '[]' > "$e/app-config-special.json"
-  : > "$ROOT/occ.log"
-  run c4 env OCC="$ROOT/occ-stub" OCC_LOG="$ROOT/occ.log" bash "$HERE/ionos-smoke-appconfig.sh" "$e" "$e-tmp"
-  check "an empty app config is imported without error" bash -c "test '$(status c4)' = 0 && grep -q config:import '$ROOT/occ.log' && ! grep -q config:app:set '$ROOT/occ.log'"
-  run c5 env OCC="$ROOT/occ-stub" OCC_LOG="$ROOT/occ.log" bash "$HERE/ionos-smoke-appconfig.sh" "$ROOT/nodir" "$ROOT/nodir-tmp"
-  check "a tree without app-config.json fails" test "$(status c5)" != 0
 }
 
 # ---------------------------------------------------------------- the mock Nextcloud (for probes and the run script)
@@ -425,7 +406,13 @@ setup_run() { # setup_run <name>: a world with an archive, a flavors folder, stu
   local w="$ROOT/$1"; rm -rf "$w"; mkdir -p "$w/work/out" "$w/bin" "$w/flavors" "$w/src/core" "$w/src/apps/files/appinfo" "$w/src/data"
   write_mock
   jq -nc '{flavor:"demo"}' > "$w/src/version.json"
-  echo '{"apps":{}}' > "$w/src/app-config.json"; echo '[]' > "$w/src/app-config-special.json"
+  # a stand-in for the generated ncw-configure.sh: it records that it ran, with which variables, and calls occ like the real one
+  cat > "$w/src/ncw-configure.sh" <<'SCRIPT'
+#!/usr/bin/env bash
+echo "configure: SMTP_PASSWORD=${SMTP_PASSWORD:-} cwd=$PWD" >> "$STUB_DIR/configure.log"
+[ "${STUB_FAIL:-}" != configure ] || { echo "ncw-configure: boom" >&2; exit 1; }
+"${PHP:-php}" "$(dirname "${BASH_SOURCE[0]}")/occ" config:import x
+SCRIPT
   echo '<?php' > "$w/src/occ"
   ( cd "$w/src" && zip -qr "$w/work/out/ncw-demo-v33.0.9.7.zip" . )
   cp "$FIX/applist-ok.json" "$w/applist.json"
@@ -485,7 +472,8 @@ sc_run() {
   check "the install ran with SQLite" grep -q 'maintenance:install --database sqlite' "$w/php.log"
   check "the required env var got a test value" grep -q '^SMTP_PASSWORD=smoke-test-value-smtp-password$' "$w/env.seen"
   check "cron.php and files:scan ran" bash -c "grep -q 'cron.php' '$w/php.log' && grep -q 'files:scan --all' '$w/php.log'"
-  check "app-config.json was imported after the install" grep -q '^occ config:import' "$w/occ.log"
+  check "ncw-configure.sh of the archive ran (as bash <script>) after the install, with the test values of the declared variables" bash -c "grep -q 'SMTP_PASSWORD=smoke-test-value-smtp-password' '$w/configure.log' && test \"\$(grep -n 'maintenance:install' '$w/php.log' | head -1 | cut -d: -f1)\" -lt \"\$(grep -n 'config:import' '$w/php.log' | head -1 | cut -d: -f1)\""
+  check "it ran with the archive's own occ (not the smoke test's own import)" grep -q '^occ config:import x' "$w/occ.log"
   check "the logs are kept" test -f "$w/logs/demo/install.log" -a -f "$w/logs/demo/app-list.json" -a -f "$w/logs/demo/nextcloud.log"
   check "the unpacked tree is removed afterwards" test ! -e "$w/tmp/demo"
   check "the run says which flavor it tested" said $r demo
@@ -517,6 +505,20 @@ sc_run() {
   setup_run r9; run_smoke r9 MOCK_FAIL=propfind
   check "a failing probe fails the run" test "$(status r9-run)" != 0
 
+  setup_run r17; run_smoke r17 STUB_FAIL=configure
+  check "a failing ncw-configure.sh fails the run" test "$(status r17-run)" != 0
+  check "its message is shown" said r17-run "ncw-configure: boom"
+  setup_run r18; rm -f "$ROOT/r18/src/ncw-configure.sh"; rm -f "$ROOT/r18/work/out/"*.zip
+  ( cd "$ROOT/r18/src" && rm -f ncw-configure.sh && zip -qr "$ROOT/r18/work/out/ncw-demo-v33.0.9.7.zip" . ); run_smoke r18
+  check "an archive without ncw-configure.sh fails the run and says so" bash -c "test '$(status r18-run)' != 0 && grep -q 'ncw-configure.sh' '$ROOT/r18-run.log'"
+  check "the install is not even started without the script" bash -c "! grep -q maintenance:install '$ROOT/r18/php.log'"
+  setup_run r19; sed 's/^app_folders:/enable_after_install:\n  - talk\napp_folders:/' "$FIX/resolved.yaml" > "$ROOT/r19/resolved.yaml"
+  cp "$FIX/applist-talk-enabled.json" "$ROOT/r19/applist.json"; run_smoke r19
+  check "the expected states include the enable_after_install apps (enabled passes)" test "$(status r19-run)" = 0
+  setup_run r20; sed 's/^app_folders:/enable_after_install:\n  - talk\napp_folders:/' "$FIX/resolved.yaml" > "$ROOT/r20/resolved.yaml"; run_smoke r20
+  check "an enable_after_install app that stays disabled fails the run" test "$(status r20-run)" != 0
+  check "and the failure says it must be enabled" said_re r20-run "'talk'.*must be enabled"
+
   # the declared env: required gets a test value, an optional one its declared default
   setup_run r10; w="$ROOT/r10"; run_smoke r10
   check "an optional variable gets its declared default" grep -q '^PHONE_REGION=DE$' "$w/env.seen"
@@ -544,7 +546,7 @@ sc_run() {
   check "version.json that names another flavor fails the run" test "$(status r16-run)" != 0
 }
 
-ALL="apps logs break appconfig probes run"
+ALL="apps logs break probes run"
 if [ $# -gt 0 ]; then SELECT=("$@"); else read -r -a SELECT <<< "$ALL"; fi
 for s in "${SELECT[@]}"; do
   echo "scenario: $s"

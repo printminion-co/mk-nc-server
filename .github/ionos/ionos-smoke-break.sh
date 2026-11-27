@@ -8,6 +8,7 @@
 #   missing-app   delete the folder of one app that a fresh install enables, so the app is missing
 #   extra-app     add a valid app folder apps/ionos_smoke_extra that the flavor does not list
 #   wrong-mode    take one default app out of defaultEnabled in core/shipped.json, so it is installed disabled
+#   skip-enable   empty the ENABLE_APPS list of ncw-configure.sh, so the apps of enable_after_install stay disabled
 # The app is the last entry of defaultEnabled (sorted) whose folder is in the archive; no flavor is named here.
 # App ids are only used when they are plain ([a-z0-9_]), never as a zip pattern.
 set -euo pipefail
@@ -17,10 +18,10 @@ export LOG_PREFIX=ionos-smoke-break
 # shellcheck source=ionos-lib.sh
 . "$HERE/ionos-lib.sh"
 
-[ $# -ge 2 ] || die "usage: ionos-smoke-break.sh <none|missing-app|extra-app|wrong-mode> <archive.zip>..."
+[ $# -ge 2 ] || die "usage: ionos-smoke-break.sh <none|missing-app|extra-app|wrong-mode|skip-enable> <archive.zip>..."
 MODE=$1
 shift
-case "$MODE" in none|missing-app|extra-app|wrong-mode) ;; *) die "unknown mode '$MODE'" ;; esac
+case "$MODE" in none|missing-app|extra-app|wrong-mode|skip-enable) ;; *) die "unknown mode '$MODE'" ;; esac
 for a in "$@"; do [ -f "$a" ] || die "no archive at $a"; done
 [ "$MODE" != none ] || { log "mode none: the archives are left as they are"; exit 0; }
 
@@ -61,6 +62,14 @@ tamper() {
     unzip -p "$ARCHIVE" core/shipped.json | jq -e --arg id "$id" '.defaultEnabled | index($id) | not' >/dev/null \
       || die "core/shipped.json still lists $id"
     log "wrong-mode: took the app '$id' out of defaultEnabled (it is installed disabled)" ;;
+  skip-enable)
+    unzip -p "$ARCHIVE" ncw-configure.sh > "$TMP/configure.sh" 2>/dev/null || die "the archive has no ncw-configure.sh"
+    grep -q '^ENABLE_APPS=(.\+)$' "$TMP/configure.sh" || die "ncw-configure.sh enables no app: nothing to skip"
+    mkdir -p "$TMP/edit"
+    sed 's/^ENABLE_APPS=(.*)$/ENABLE_APPS=()/' "$TMP/configure.sh" > "$TMP/edit/ncw-configure.sh"
+    ( cd "$TMP/edit" && zip -q "$ARCHIVE" ncw-configure.sh ) || die "could not write ncw-configure.sh to the archive"
+    unzip -p "$ARCHIVE" ncw-configure.sh | grep -q '^ENABLE_APPS=()$' || die "ncw-configure.sh still lists apps to enable"
+    log "skip-enable: emptied ENABLE_APPS in ncw-configure.sh" ;;
   extra-app)
     ! grep -q '^apps/ionos_smoke_extra/' "$TMP/list" || die "apps/ionos_smoke_extra exists already"
     mkdir -p "$TMP/edit/apps/ionos_smoke_extra/appinfo"

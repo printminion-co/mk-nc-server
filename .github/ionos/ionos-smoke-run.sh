@@ -8,10 +8,11 @@
 # The archive is treated as untrusted data: it is unpacked into a new empty folder, paths are passed as arguments,
 # and the only code that runs from the unpacked tree is `php occ`, `php cron.php` and the web server serving it.
 #
-# How apps get enabled: the deployment does nothing for that. `occ maintenance:install` installs and enables every
-# app that core/shipped.json lists in alwaysEnabled or defaultEnabled, wherever it lives (also an added app that is
-# not in shippedApps). So the smoke test runs no `occ app:enable`: an app that is not enabled after the install is
-# exactly what the comparison must show.
+# How apps get enabled: `occ maintenance:install` installs and enables every app that core/shipped.json lists in
+# alwaysEnabled or defaultEnabled, wherever it lives (also an added app that is not in shippedApps). Apps the
+# installer cannot enable are `available` and listed in the flavor's enable_after_install; the archive's own
+# ncw-configure.sh (run right after the install, as the deployment does) enables them. The smoke test runs no
+# `occ app:enable` itself: an app that is not enabled afterwards is exactly what the comparison must show.
 #
 # Environment:
 #   WORK            the run's work folder: out/ holds the archives (ncw-<flavor>-v<...>.zip)
@@ -106,6 +107,8 @@ smoke_one() {
     bad "version.json names the flavor '$tree_flavor', the archive name says '$flavor'"; rm -rf "$tree"; echo "::endgroup::"; return 1
   fi
 
+  [ -f "$tree/ncw-configure.sh" ] || { bad "the archive has no ncw-configure.sh"; rm -rf "$tree"; echo "::endgroup::"; return 1; }
+
   # the variables the flavor declares: a test value for the required ones, the declared default for the others
   while IFS=$'\t' read -r name required def; do
     [ -n "$name" ] || continue
@@ -126,10 +129,11 @@ smoke_one() {
   if [ "$rc" -ne 0 ]; then
     bad "occ maintenance:install failed (exit $rc), see install.log"
   else
-    # the deployment's next step: import the app configuration
-    if ! ( cd "$tree" && OCC="$PHP occ" bash "$HERE/ionos-smoke-appconfig.sh" "$tree" "$TMP_ROOT/$flavor-appconfig" ) > "$dir/appconfig.log" 2>&1; then
-      cat "$dir/appconfig.log" >&2; bad "importing the app configuration failed"
-    else cat "$dir/appconfig.log"; fi
+    # the deployment's next step: the archive's own ncw-configure.sh (app config, special settings, enable_after_install)
+    log "$flavor: bash ncw-configure.sh"
+    if ! ( cd "$tree" && PHP="$PHP" bash ncw-configure.sh ) > "$dir/configure.log" 2>&1; then
+      cat "$dir/configure.log" >&2; bad "ncw-configure.sh failed, see configure.log"
+    else cat "$dir/configure.log"; fi
 
     # serve the tree: php -S, no router (index.php/remote.php paths)
     port=$(free_port); url="http://localhost:$port"

@@ -117,3 +117,9 @@ resolved_env() {
     /^    default:/ { def = val($0); next }
     END { flush() }' "$1"
 }
+
+# The apps of `ncw resolve` output <file> that the flavor enables after the install (enable_after_install), one id per line.
+resolved_enable_after_install() {
+  awk '/^[A-Za-z_]+:/ { sec = $1; sub(/:$/, "", sec); next }
+       sec == "enable_after_install" && /^  - / { print $2 }' "$1"
+}
