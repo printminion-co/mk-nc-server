@@ -214,6 +214,202 @@ sc_logs() {
   check "the shipped allow-list is valid" test "$(status l8)" = 0
 }
 
+# ---------------------------------------------------------------- scenario: brand (the text check on fixture pages)
+sc_brand() {
+  local P="$ROOT/bpages" B="$HERE/ionos-smoke-brand.sh" A="$ROOT/ballow.txt" b64
+  rm -rf "$P"; mkdir -p "$P"
+  cat > "$A" <<'EOF2'
+# a test allow-list
+* :: IONOS Nextcloud Workspace :: the product name
+* :: https://docs\.nextcloud\.com/server/33/go\.php\?to=[a-z-]+ :: documentation link
+login :: id="nextcloud" :: element id on the login page only
+EOF2
+  printf '<html><title>Login - IONOS Nextcloud Workspace</title><a href="https:\\/\\/docs.nextcloud.com\\/server\\/33\\/go.php?to=admin-install">docs</a><div id="nextcloud"></div></html>\n' > "$P/login.html"
+  run c1 bash "$B" --scan "$P" "$A"
+  check "a page with the product name, a documentation link (JSON-escaped slashes) and an allowed id passes" test "$(status c1)" = 0
+  check "the passing page is reported with its allowed occurrences" said_re c1 "ok - brand check, page login \(3 allowed"
+
+  printf '<html><p>Welcome to Nextcloud</p> IONOS Nextcloud Workspace</html>\n' > "$P/files.html"
+  run c2 bash "$B" --scan "$P" "$A"
+  check "a bare Nextcloud on a page fails the check" test "$(status c2)" != 0
+  check "the failure names the page and shows the context" said_re c2 "page files: 1 occurrence.*\n?" 
+  check "the context of the occurrence is printed" said c2 "Welcome to Nextcloud"
+  check "the other page still passes" said_re c2 "ok - brand check, page login"
+  rm -f "$P/files.html"
+
+  local t
+  for t in nextcloud NEXTCLOUD NeXtCloud "my-nextcloud.example" "https://nextcloud.com/x" "Nextcloud-Server"; do
+    printf '<html>%s</html>\n' "$t" > "$P/other.html"
+    run c3 bash "$B" --scan "$P" "$A"
+    check "the text '$t' fails the check (any case, in text, URLs and compounds)" test "$(status c3)" != 0
+  done
+  printf '<html>IONOS Nextcloud Workspace and nextcloud</html>\n' > "$P/other.html"
+  run c3 bash "$B" --scan "$P" "$A"
+  check "an allowed phrase does not allow a second, bare occurrence on the same page" bash -c "test '$(status c3)' != 0 && grep -q 'page other: 1 occurrence' '$ROOT/c3.log'"
+  printf '<html>IONOS  Nextcloud  Workspace</html>\n' > "$P/other.html"
+  run c3 bash "$B" --scan "$P" "$A"
+  check "the product name must match exactly (other spacing fails)" test "$(status c3)" != 0
+  printf '<html>ionos nextcloud workspace</html>\n' > "$P/other.html"
+  run c3 bash "$B" --scan "$P" "$A"
+  check "the allow-list is case sensitive (the product name in lower case fails)" test "$(status c3)" != 0
+  rm -f "$P/other.html"
+
+  # the page glob: an entry for the login page does not allow the id on another page
+  printf '<div id="nextcloud"></div>\n' > "$P/files.html"
+  run c4 bash "$B" --scan "$P" "$A"
+  check "an entry for one page does not allow the text on another page" test "$(status c4)" != 0
+  rm -f "$P/files.html"
+
+  # initial states are decoded
+  b64=$(printf 'Nextcloud hidden in a state' | base64 -w0)
+  printf '<html><input type="hidden" id="initial-state-app-key" value="%s"></html>\n' "$b64" > "$P/settings.html"
+  run c5 bash "$B" --scan "$P" "$A"
+  check "a Base64 initial-state value is decoded and checked" test "$(status c5)" != 0
+  check "the decoded context is shown" said c5 "hidden in a state"
+  b64=$(printf 'IONOS Nextcloud Workspace' | base64 -w0)
+  printf '<html><input type="hidden" id="initial-state-app-key" value="%s"></html>\n' "$b64" > "$P/settings.html"
+  run c5 bash "$B" --scan "$P" "$A"
+  check "a decoded initial-state value with only the product name passes" test "$(status c5)" = 0
+  rm -f "$P/settings.html"
+
+  # a mail as text
+  printf 'Hello\n-- \nNextcloud\n' > "$P/mail-text.txt"
+  run c6 bash "$B" --scan "$P" "$A"
+  check "a text page (the plain text mail) is checked too" test "$(status c6)" != 0
+  rm -f "$P/mail-text.txt"
+
+  # stale entries are a notice, not a failure
+  printf '%s\n' '* :: this text is on no page :: a stale entry' >> "$A"
+  run c7 bash "$B" --scan "$P" "$A"
+  check "an entry that matched nothing is reported as stale and does not fail" bash -c "test '$(status c7)' = 0 && grep -q 'notice.*matched nothing' '$ROOT/c7.log'"
+
+  # allow-list files
+  run c8 bash "$B" --scan "$P" "$ROOT/no-such-allowlist.txt"
+  check "a missing allow-list fails" test "$(status c8)" != 0
+  local bad
+  for bad in 'login :: foo' 'login :: foo :: ' ' :: foo :: reason' 'login ::  :: reason' 'login :: [unclosed :: reason' 'login :: x* :: matches the empty string' 'just some text'; do
+    printf '%s\n' "$bad" > "$ROOT/ballow-bad.txt"
+    run c9 bash "$B" --scan "$P" "$ROOT/ballow-bad.txt"
+    check "a bad allow-list entry fails: $bad" test "$(status c9)" != 0
+  done
+  printf '# only comments\n\n' > "$ROOT/ballow-empty.txt"
+  run c10 bash "$B" --scan "$P" "$ROOT/ballow-empty.txt"
+  check "an allow-list without entries allows nothing (the product name fails)" test "$(status c10)" != 0
+  mkdir -p "$ROOT/bempty"
+  run c11 bash "$B" --scan "$ROOT/bempty" "$A"
+  check "no pages is no pass" test "$(status c11)" != 0
+  run c11 bash "$B" --scan "$ROOT/does-not-exist" "$A"
+  check "a missing pages folder fails" test "$(status c11)" != 0
+  run c11 bash "$B" --scan
+  check "missing arguments fail" test "$(status c11)" != 0
+  run c11 bash "$B" http://localhost:1
+  check "wrong arguments fail" test "$(status c11)" != 0
+
+  # the allow-list that ships with the fork: valid, and strict
+  rm -rf "$P"; mkdir -p "$P"
+  printf '<html>IONOS Nextcloud Workspace</html>\n' > "$P/login.html"
+  run c12 bash "$B" --scan "$P"
+  check "the shipped allow-list is valid and allows the product name" test "$(status c12)" = 0
+  local t2
+  for t2 in "Nextcloud" "Welcome to Nextcloud" "https://nextcloud.com/install/" "Nextcloud Hub" "Powered by Nextcloud" "Nextcloud GmbH" 'https://github.com/nextcloud' "nextcloud_announcements" "Nextcloud Account"; do
+    printf '<html>%s</html>\n' "$t2" > "$P/login.html"
+    run c13 bash "$B" --scan "$P"
+    check "the shipped allow-list does not allow '$t2' on the login page" test "$(status c13)" != 0
+  done
+  printf '<html>Nextcloud Hub 26 Winter</a> (33.0.9)</html>\n' > "$P/files.html"; rm -f "$P/login.html"
+  run c13 bash "$B" --scan "$P"
+  check "the shipped allow-list keeps the Nextcloud Hub label to the admin overview only" test "$(status c13)" != 0
+  rm -f "$P/files.html"; printf '<p>x>Nextcloud Hub 26 Winter</a> (33.0.9)</p>\n' > "$P/overview.html"
+  run c13 bash "$B" --scan "$P"
+  check "the Nextcloud Hub label is allowed on the admin overview" test "$(status c13)" = 0
+  check "every entry of the shipped allow-list has a page, a regexp and a reason" bash -c "! grep -vE '^[[:space:]]*(#|\$)' '$HERE/ionos-smoke-brand-allowlist.txt' | grep -vE '^[^ ]+ :: .+ :: .+\$'"
+  check "no entry of the shipped allow-list allows the bare word" bash -c "! grep -vE '^[[:space:]]*(#|\$)' '$HERE/ionos-smoke-brand-allowlist.txt' | awk -F ' :: ' '{print \$2}' | grep -xiE '(nextcloud|.\\*nextcloud.\\*|\\(\\?i\\).*)'"
+}
+
+# ---------------------------------------------------------------- scenario: brand_run (fetch, theme probes and the mail against the mock)
+brand_world() { # brand_world <name> [theme]: a tree, a resolved flavor and a stub php; sets BW
+  BW="$ROOT/$1"; rm -rf "$BW"; mkdir -p "$BW/tree" "$BW/bin" "$BW/sysconf"
+  write_mock
+  cp "$FIX/resolved.yaml" "$BW/resolved.yaml"
+  if [ -n "${2:-}" ]; then
+    sed "s/^themes: \[\]/themes:\n  - $2\nenforce_theme: $2/" "$FIX/resolved.yaml" > "$BW/resolved.yaml"
+    printf '%s\n' "$2" > "$BW/sysconf/enforce_theme"
+    printf '%s\n' "$2" > "$BW/sysconf/theme"
+    printf '%s\n' 'OC\Ncw\Mail\IonosEMailTemplate' > "$BW/sysconf/mail_template_class"
+    jq -nc '{class:"OC\\Ncw\\Mail\\IonosEMailTemplate",html:"<p>IONOS Nextcloud Workspace</p>",text:"mail IONOS Nextcloud Workspace"}' > "$BW/mail.json"
+    echo '[{"app":"theming","key":"disable-user-theming","value":"1","type":"boolean"}]' > "$BW/tree/app-config-special.json"
+  fi
+  cat > "$BW/bin/php" <<'STUB'
+#!/usr/bin/env bash
+case "$(basename "$1")" in
+  occ) shift; [ "$1" = config:system:get ] && { [ ! -f "$STUB_DIR/sysconf/$2" ] || cat "$STUB_DIR/sysconf/$2"; } ;;
+  ionos-smoke-mail.php) if [ -f "$STUB_DIR/mail.json" ]; then cat "$STUB_DIR/mail.json"; else echo '{"class":"OC\\Mail\\EMailTemplate","html":"<p>mail</p>","text":"mail"}'; fi ;;
+  *) echo "stub php: unexpected $*" >&2; exit 2 ;;
+esac
+STUB
+  chmod +x "$BW/bin/php"
+}
+brand_run() { # brand_run <name> [VAR=value ...]: mock + brand script; the log is <name>.log
+  local n=$1; shift
+  mock_start "$@"
+  run "$n" env PATH="$BW/bin:$PATH" PHP="$BW/bin/php" STUB_DIR="$BW" SMOKE_ADMIN_USER=admin SMOKE_ADMIN_PASS=Smoke-Pass SMOKE_BRAND_ALLOWLIST="$FIX/brand-allow.txt" \
+    bash "$HERE/ionos-smoke-brand.sh" "$MOCK_URL" "$BW/tree" "$BW/resolved.yaml" "$BW/out"
+}
+sc_brand_run() {
+  printf '* :: IONOS Nextcloud Workspace :: the product name\n' > "$FIX/brand-allow.txt"
+  brand_world bw1
+  brand_run d1
+  check "a flavor without theme or mail class: the pages are checked and the run passes" test "$(status d1)" = 0
+  check "the pages and the mail are kept" bash -c "ls '$BW/out/pages' | tr '\n' ' ' | grep -q 'admin-theming.html files.html login.html mail-html.html mail-text.txt overview.html personal.html settings.html user-theming.html'"
+  check "no theme probe runs for a flavor without enforce_theme" bash -c "! grep -qiE 'enforce_theme|theme stylesheet|data-theme' '$ROOT/d1.log'"
+  check "the settings the flavor does not set are not probed (no lock, no mail class)" bash -c "! grep -qiE 'locked|mail uses|user theming is disabled' '$ROOT/d1.log'"
+
+  brand_world bw2 ionos
+  brand_run d2 MOCK_THEME=ionos
+  check "a flavor with an enforced theme, locks and a mail class: every probe passes" test "$(status d2)" = 0
+  local p
+  for p in "enforce_theme is ionos" "the login page carries data-theme-ionos" "theme stylesheet of ionos" "only the enforced theme" "user theming is disabled" "admin theming is locked" "system mail uses the template"; do
+    check "probe reported: $p" grep -q -- "ok - .*$p" "$ROOT/d2.log"
+  done
+
+  local case_
+  for case_ in "css:theme stylesheet" "cssbody:theme stylesheet" "notheme:enforced theme on the login page" "personal:page personal" "user-theming:page user-theming" "admin-theming:page admin-theming"; do
+    brand_world bw3 ionos
+    brand_run d3 MOCK_THEME=ionos MOCK_FAIL="${case_%%:*}"
+    check "a failing endpoint fails the run (${case_%%:*})" test "$(status d3)" != 0
+    check "the failure is named (${case_%%:*})" said_re d3 "FAIL - ${case_#*:}"
+  done
+  brand_world bw4 ionos; brand_run d4 MOCK_THEME=ionos MOCK_USER_THEMING=on
+  check "user theming that is still enabled fails although the archive disables it" bash -c "test '$(status d4)' != 0 && grep -q 'FAIL - user theming' '$ROOT/d4.log'"
+  brand_world bw5 ionos; brand_run d5 MOCK_THEME=ionos MOCK_ADMIN_THEMEABLE=1
+  check "an admin theming section that is not locked fails although the system theme is set" bash -c "test '$(status d5)' != 0 && grep -q 'FAIL - admin theming' '$ROOT/d5.log'"
+  brand_world bw6 ionos; brand_run d6 MOCK_THEME=ionos MOCK_THEMES='[{"id":"ionos"},{"id":"dark"}]'
+  check "another theme in the user theming list fails" bash -c "test '$(status d6)' != 0 && grep -q 'FAIL - theme list' '$ROOT/d6.log'"
+  brand_world bw7 ionos; echo other > "$BW/sysconf/enforce_theme"; brand_run d7 MOCK_THEME=ionos
+  check "an enforce_theme of the instance that differs from the resolved flavor fails" bash -c "test '$(status d7)' != 0 && grep -q 'FAIL - enforce_theme' '$ROOT/d7.log'"
+  brand_world bw8 ionos; jq -nc '{class:"OC\\Mail\\EMailTemplate",html:"<p>x</p>",text:"x"}' > "$BW/mail.json"; brand_run d8 MOCK_THEME=ionos
+  check "a sample mail made by the stock template fails although mail_template_class is set" bash -c "test '$(status d8)' != 0 && grep -q 'FAIL - mail template' '$ROOT/d8.log'"
+  brand_world bw9 ionos; jq -nc '{class:"OC\\Ncw\\Mail\\IonosEMailTemplate",html:"<p>Powered by Nextcloud</p>",text:"x"}' > "$BW/mail.json"; brand_run d9 MOCK_THEME=ionos
+  check "a Nextcloud text in the sample mail fails the brand check" bash -c "test '$(status d9)' != 0 && grep -q 'page mail-html' '$ROOT/d9.log'"
+  brand_world bw10 ionos; brand_run d10 MOCK_THEME=ionos MOCK_BRAND=login
+  check "a Nextcloud text on the login page fails the run" bash -c "test '$(status d10)' != 0 && grep -q 'page login: 1 occurrence' '$ROOT/d10.log'"
+  brand_world bw11 ionos; brand_run d11 MOCK_THEME=ionos MOCK_BRAND=files
+  check "a Nextcloud text on the files page fails the run" bash -c "test '$(status d11)' != 0 && grep -q 'page files: 1 occurrence' '$ROOT/d11.log'"
+  brand_world bw12 ionos; rm -f "$BW/mail.json"
+  cat > "$BW/bin/php" <<'STUB'
+#!/usr/bin/env bash
+case "$(basename "$1")" in occ) exit 0 ;; *) echo oops >&2; exit 1 ;; esac
+STUB
+  brand_run d12 MOCK_THEME=ionos
+  check "a sample mail that cannot be made fails the run" bash -c "test '$(status d12)' != 0 && grep -q 'FAIL - sample mail' '$ROOT/d12.log'"
+  brand_world bw13; brand_run d13 MOCK_FAIL=settings
+  check "a page that does not answer fails the run" bash -c "test '$(status d13)' != 0 && grep -q 'FAIL - page settings' '$ROOT/d13.log'"
+  mock_stop
+  run d14 env PATH="$BW/bin:$PATH" PHP="$BW/bin/php" STUB_DIR="$BW" SMOKE_ADMIN_USER=admin SMOKE_ADMIN_PASS=Smoke-Pass SMOKE_BRAND_ALLOWLIST="$FIX/brand-allow.txt" \
+    bash "$HERE/ionos-smoke-brand.sh" "http://localhost:1" "$BW/tree" "$BW/resolved.yaml" "$BW/out-none"
+  check "no server at all fails" test "$(status d14)" != 0
+}
+
 # ---------------------------------------------------------------- scenario: break (the tamper script)
 mkzip() { # mkzip <zip>: a small archive shaped like a flavor archive
   local d="$ROOT/zipsrc"; rm -rf "$d"; mkdir -p "$d/core" "$d/apps/files/appinfo" "$d/apps-upstream/weather_status/appinfo" "$d/apps-upstream/contacts/appinfo" "$d/config"
@@ -277,6 +473,23 @@ SCRIPT
   printf '#!/usr/bin/env bash\nENABLE_APPS=()\n' > "$ROOT/zipsrc/ncw-configure.sh"; ( cd "$ROOT/zipsrc" && zip -q "$z" ncw-configure.sh )
   run b9 bash "$HERE/ionos-smoke-break.sh" skip-enable "$z"
   check "skip-enable fails when the script enables no app (nothing to prove)" test "$(status b9)" != 0
+  # brand: a visible Nextcloud text in the login template
+  mkzip "$z"
+  mkdir -p "$ROOT/zipsrc/core/templates"; printf '<?php\nif (true) {\n?>\n<div id="login"></div>\n<?php } ?>\n<p>login</p>\n' > "$ROOT/zipsrc/core/templates/login.php"
+  ( cd "$ROOT/zipsrc" && zip -q "$z" core/templates/login.php )
+  run b10 bash "$HERE/ionos-smoke-break.sh" brand "$z"
+  check "brand appends a visible Nextcloud text to the login template" bash -c "test '$(status b10)' = 0 && unzip -p '$z' core/templates/login.php | grep -q 'Nextcloud (added by ionos-smoke-break.sh)'"
+  check "brand keeps the template and appends outside of PHP code" bash -c "unzip -p '$z' core/templates/login.php | head -n 6 | diff -q - '$ROOT/zipsrc/core/templates/login.php' >/dev/null && php -l <(unzip -p '$z' core/templates/login.php) >/dev/null 2>&1 || php -r 'exit(0);'"
+  check "brand names the file" said b10 "core/templates/login.php"
+  mkzip "$z"
+  run b11 bash "$HERE/ionos-smoke-break.sh" brand "$z"
+  check "brand fails clearly when the archive has no login template" test "$(status b11)" != 0
+  mkdir -p "$ROOT/zipsrc/core/templates"; printf '%s\n' '<div></div>' '<?php' 'echo 1;' > "$ROOT/zipsrc/core/templates/login.php"
+  ( cd "$ROOT/zipsrc" && zip -q "$z" core/templates/login.php )
+  run b12 bash "$HERE/ionos-smoke-break.sh" brand "$z"
+  check "brand fails when the login template ends in PHP mode (the text would be code)" test "$(status b12)" != 0
+  check "that failure leaves the template as it was" bash -c "unzip -p '$z' core/templates/login.php | cmp -s - '$ROOT/zipsrc/core/templates/login.php'"
+  rm -rf "$ROOT/zipsrc/core/templates"
   # an archive whose shipped.json lists no default app (nothing to break)
   local d="$ROOT/zipnone"; rm -rf "$d"; mkdir -p "$d/core" "$d/apps/files/appinfo"; echo '{"defaultEnabled":[]}' > "$d/core/shipped.json"; echo '<info/>' > "$d/apps/files/appinfo/info.xml"
   ( cd "$d" && zip -qr "$ROOT/none.zip" . )
@@ -416,6 +629,8 @@ sc_break_upgrade() {
   check "a fresh-install mode leaves the archives of the upgrade job alone" bash -c "test '$(status k5)' = 0 && cmp '$z' '$ROOT/bu-orig.zip'"
   run k6 bash -c ". '$HERE/ionos-lib.sh'; . '$HERE/ionos-smoke-lib.sh'; echo \"\$(smoke_break_for fresh missing-app) \$(smoke_break_for upgrade missing-app) \$(smoke_break_for upgrade no-buildnumber) \$(smoke_break_for fresh none)\""
   check "smoke_break_for maps every mode to its own smoke test" said k6 "missing-app none no-buildnumber none"
+  run k6 bash -c ". '$HERE/ionos-lib.sh'; . '$HERE/ionos-smoke-lib.sh'; echo \"\$(smoke_break_for fresh brand) \$(smoke_break_for upgrade brand)\""
+  check "the brand break is for the fresh-install test only" said k6 "brand none"
   run k7 bash "$HERE/ionos-smoke-break.sh" bogus "$z"
   check "an unknown mode still fails" test "$(status k7)" != 0
 }
@@ -557,10 +772,12 @@ case "$(basename "$1")" in
         [ -z "${STUB_UPGRADE_LOG:-}" ] || echo "$STUB_UPGRADE_LOG" >> "$(cat "$STUB_DIR/datadir")/nextcloud.log"
         echo "Update successful" ;;
       files:scan) echo scanned ;;
+      config:system:get) [ ! -f "$STUB_DIR/sysconf/$2" ] || cat "$STUB_DIR/sysconf/$2" ;;
       config:import|config:app:set) echo "occ $*" >> "$STUB_DIR/occ.log" ;;
       *) echo "stub occ: $*" ;;
     esac ;;
   cron.php) echo cron ;;
+  ionos-smoke-mail.php) if [ -f "$STUB_DIR/mail.json" ]; then cat "$STUB_DIR/mail.json"; else echo '{"class":"OC\\Mail\\EMailTemplate","html":"<p>mail</p>","text":"mail"}'; fi ;;
   *) echo "stub php: unexpected $*" >&2; exit 2 ;;
 esac
 STUB
@@ -589,6 +806,9 @@ sc_upgrade() {
   check "ncw-configure.sh ran after the upgrade with the test values of the declared variables" grep -q 'SMTP_PASSWORD=smoke-test-value-smtp-password' "$w/configure.log"
   check "the version is checked: old and new are in the log" said $r "33.0.9.1 -> 33.0.9.1.7"
   check "the probes, cron and the scan ran" bash -c "grep -q 'ok - status' '$ROOT/$r.log' && grep -q cron.php '$w/php.log' && grep -q 'files:scan' '$w/php.log'"
+  check "the brand check and the theme probes ran on the upgraded instance" bash -c "grep -q 'brand check and theme probes' '$ROOT/$r.log' && test -f '$w/logs/demo/brand.log' -a -f '$w/logs/demo/brand/pages/login.html'"
+  setup_up u1b; run_up u1b MOCK_BRAND=login
+  check "a Nextcloud text on the login page fails the upgrade smoke test too" bash -c "test '$(status u1b-run)' != 0 && grep -q 'brand check.*page login: 1 occurrence' '$ROOT/u1b-run.log'"
   check "the logs and timings are kept" test -f "$w/logs/demo/upgrade.log" -a -f "$w/logs/demo/app-list-before.json" -a -f "$w/logs/demo/app-list.json" -a -s "$w/logs/demo/timings.txt"
   check "timings name the phases" bash -c "grep -q '^install vanilla ' '$w/logs/demo/timings.txt' && grep -q '^occ upgrade ' '$w/logs/demo/timings.txt'"
   check "the unpacked trees are removed afterwards" test ! -e "$w/tmp/demo"
@@ -717,7 +937,7 @@ sc_gate() {
   check "workflow: both upgrade jobs keep their logs with if: always()" test "$(awk '/^  upgrade-smoke-sqlite:$/,/^  gate:$/' "$wf" | grep -c -A1 'if: always()')" -ge 2
   check "workflow: only GitHub-owned actions, all pinned by a full commit sha" bash -c "! grep -E '^ +uses:' '$wf' | grep -vE 'uses: actions/[a-z/-]+@[0-9a-f]{40} # v'"
   check "workflow: the MariaDB image is pinned by digest, in one place, with a repository variable override" bash -c "test \$(grep -c 'mariadb:[0-9.]*@sha256:[0-9a-f]\{64\}' '$wf') = 1 && grep -q 'vars.IONOS_MARIADB_IMAGE' '$wf'"
-  check "workflow: smoke_break lists the upgrade modes" bash -c "grep -q 'options: \[none, missing-app, extra-app, wrong-mode, skip-enable, removed-in-shipped, no-buildnumber\]' '$wf'"
+  check "workflow: smoke_break lists the upgrade modes" bash -c "grep -q 'options: \[none, missing-app, extra-app, wrong-mode, skip-enable, brand, removed-in-shipped, no-buildnumber\]' '$wf'"
   check "workflow: no expression inside any run block" bash -c "! awk '/^ +run: \\|\$/ {f=1; next} /^ +run: / {print; next} f && /^      [^ ]/ {f=0} f {print}' '$wf' | grep -q '\${{'"
 }
 
@@ -734,7 +954,10 @@ $dir = getenv('MOCK_DIR');
 $pass = getenv('MOCK_PASS');
 $basic = ($_SERVER['PHP_AUTH_USER'] ?? '') === 'admin' && ($_SERVER['PHP_AUTH_PW'] ?? '') === $pass;
 $session = ($_COOKIE['mocksession'] ?? '') === 'ok';
-$page = fn(string $t) => print("<html><head data-requesttoken=\"tok123\"></head><body>$t " . str_repeat('x', 400) . "</body></html>");
+$theme = getenv('MOCK_THEME') ?: '';
+$brand = getenv('MOCK_BRAND') ?: '';
+$state = fn(string $id, string $value) => '<input type="hidden" id="initial-state-' . $id . '" value="' . base64_encode($value) . '">';
+$page = fn(string $t, string $extra = '') => print("<html><head data-requesttoken=\"tok123\"></head><body" . ($theme !== '' && $fail !== 'notheme' ? " data-theme-$theme" : '') . ">$t $extra" . ($brand === $t ? ' Welcome to Nextcloud ' : '') . str_repeat('x', 400) . "</body></html>");
 if ($uri === '/status.php') {
     header('Content-Type: application/json');
     echo json_encode(['installed' => $fail !== 'status', 'maintenance' => false, 'needsDbUpgrade' => false, 'version' => '33.0.9.1.5']);
@@ -764,11 +987,22 @@ if ($uri === '/status.php') {
         if ($fail === 'get') { http_response_code(404); return; }
         echo $fail === 'content' ? 'something else' : file_get_contents($file);
     } elseif ($method === 'DELETE') { @unlink($file); http_response_code(204); }
-} elseif ($uri === '/index.php/apps/files/' || $uri === '/index.php/settings/admin' || $uri === '/index.php/settings/admin/overview') {
+} elseif (preg_match('#^/index\.php/apps/theming/theme/([a-z0-9-]+)\.css$#', $uri, $m)) {
+    if ($fail === 'css') { http_response_code(404); echo '<!DOCTYPE html>'; return; }
+    header('Content-Type: text/css');
+    echo $fail === 'cssbody' ? 'body { color: red }' : "[data-theme-{$m[1]}] { --color-primary:#123456; }";
+} elseif (in_array($uri, ['/index.php/apps/files/', '/index.php/settings/admin', '/index.php/settings/admin/overview', '/index.php/settings/user', '/index.php/settings/user/theming', '/index.php/settings/admin/theming'], true)) {
     if (!$session) { http_response_code(401); echo 'login required'; return; }
-    $key = ['/index.php/apps/files/' => 'files', '/index.php/settings/admin' => 'settings', '/index.php/settings/admin/overview' => 'overview'][$uri];
+    $key = ['/index.php/apps/files/' => 'files', '/index.php/settings/admin' => 'settings', '/index.php/settings/admin/overview' => 'overview',
+        '/index.php/settings/user' => 'personal', '/index.php/settings/user/theming' => 'user-theming', '/index.php/settings/admin/theming' => 'admin-theming'][$uri];
     if ($fail === $key) { http_response_code(500); echo 'Internal Server Error'; return; }
-    $page($key);
+    $extra = '';
+    if ($key === 'user-theming') {
+        $listed = getenv('MOCK_THEMES') ?: ($theme !== '' ? json_encode([['id' => $theme]]) : '[]');
+        $extra = $state('theming-themes', $listed) . $state('theming-isUserThemingDisabled', getenv('MOCK_USER_THEMING') === 'on' ? 'false' : 'true');
+    }
+    if ($key === 'admin-theming') { $extra = $state('theming-adminThemingInfo', json_encode(['isThemeable' => getenv('MOCK_ADMIN_THEMEABLE') === '1'])); }
+    $page($key, $extra);
 } else { http_response_code(404); echo 'not found'; }
 PHP
 }
@@ -864,10 +1098,12 @@ case "$(basename "$1")" in
         env | grep -E '^(SMTP_PASSWORD|PHONE_REGION)=' > "$STUB_DIR/env.seen" || true ;;
       app:list) cat "$STUB_DIR/applist.json" ;;
       files:scan) [ "${STUB_FAIL:-}" = scan ] && exit 1; echo scanned ;;
+      config:system:get) [ ! -f "$STUB_DIR/sysconf/$2" ] || cat "$STUB_DIR/sysconf/$2" ;;
       config:import|config:app:set) echo "occ $*" >> "$STUB_DIR/occ.log" ;;
       *) echo "stub occ: $*" ;;
     esac ;;
   cron.php) [ "${STUB_FAIL:-}" = cron ] && exit 1; echo cron ;;
+  ionos-smoke-mail.php) if [ -f "$STUB_DIR/mail.json" ]; then cat "$STUB_DIR/mail.json"; else echo '{"class":"OC\\Mail\\EMailTemplate","html":"<p>mail</p>","text":"mail"}'; fi ;;
   *) echo "stub php: unexpected $*" >&2; exit 2 ;;
 esac
 STUB
@@ -925,6 +1161,11 @@ sc_run() {
   setup_run r9; run_smoke r9 MOCK_FAIL=propfind
   check "a failing probe fails the run" test "$(status r9-run)" != 0
 
+  setup_run r21; run_smoke r21 MOCK_BRAND=login
+  check "a Nextcloud text on the login page fails the whole smoke run" test "$(status r21-run)" != 0
+  check "the failure is named as the brand check and the page is shown" said_re r21-run "brand check.*page login: 1 occurrence"
+  check "the brand logs are kept (brand.log and the pages)" test -f "$ROOT/r21/logs/demo/brand.log" -a -f "$ROOT/r21/logs/demo/brand/pages/login.html"
+  check "a healthy run also keeps them" test -f "$ROOT/r1/logs/demo/brand.log" -a -f "$ROOT/r1/logs/demo/brand/pages/mail-html.html"
   setup_run r17; run_smoke r17 STUB_FAIL=configure
   check "a failing ncw-configure.sh fails the run" test "$(status r17-run)" != 0
   check "its message is shown" said r17-run "ncw-configure: boom"
@@ -966,7 +1207,7 @@ sc_run() {
   check "version.json that names another flavor fails the run" test "$(status r16-run)" != 0
 }
 
-ALL="apps logs break probes run apps_upgrade logs_expected break_upgrade vanilla upgrade gate"
+ALL="apps logs break brand brand_run probes run apps_upgrade logs_expected break_upgrade vanilla upgrade gate"
 if [ $# -gt 0 ]; then SELECT=("$@"); else read -r -a SELECT <<< "$ALL"; fi
 for s in "${SELECT[@]}"; do
   echo "scenario: $s"

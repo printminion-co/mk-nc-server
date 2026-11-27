@@ -190,8 +190,9 @@ For every archive in `out/`:
    PROPFIND, PUT and GET with a content compare, a session through the login form (cookie jar, request token and an
    `Origin` header, which Nextcloud requires) and with it the files page, admin settings and admin overview. All probes run;
    each failure is named.
-7. `php cron.php` and `occ files:scan --all`.
-8. `occ app:list --output=json_pretty` against the resolved flavor (`ionos-smoke-apps.sh`): `always` and `default` apps
+7. The brand check and the theme probes (`ionos-smoke-brand.sh`, see "Brand check and theme probes" below).
+8. `php cron.php` and `occ files:scan --all`.
+9. `occ app:list --output=json_pretty` against the resolved flavor (`ionos-smoke-apps.sh`): `always` and `default` apps
    enabled, `available` apps present and disabled, except the ones in `enable_after_install` (listed by `ncw resolve`),
    which must be enabled, `removed` apps absent, and an app the flavor does not list is an error. Each problem names the
    app and the mode. How apps get enabled: `occ maintenance:install` itself installs and enables every app listed in
@@ -199,7 +200,7 @@ For every archive in `out/`:
    `shippedApps`. An app the installer cannot enable (groupfolders: its migration needs the app loaded) is `available`
    and listed in `enable_after_install`, and `ncw-configure.sh` enables it. The smoke test runs no `occ app:enable`
    itself: it would hide a wrong `shipped.json`.
-9. `data/nextcloud.log` (`ionos-smoke-logs.sh`): fails on every entry at level 3 (error) or higher whose message does not match
+10. `data/nextcloud.log` (`ionos-smoke-logs.sh`): fails on every entry at level 3 (error) or higher whose message does not match
    `ionos-smoke-log-allowlist.txt`, on a line that is not JSON, and ALWAYS on a `Disabled incompatible app` line (at any
    level, whatever the allow-list says).
 
@@ -209,7 +210,34 @@ hash, iconv, libxml, mbstring, openssl, pdo_sqlite, posix, session, SimpleXML, X
 bcmath, apcu and others (`images/ubuntu/scripts/build/install-php.sh` of `actions/runner-images`); it also has `unzip`, `zip`,
 `curl` and `jq`.
 
-### The allow-list
+### Brand check and theme probes
+
+`ionos-smoke-brand.sh <base url> <tree> <resolved.yaml> <output folder>` is called by `smoke_checks` in `ionos-smoke-lib.sh`, so the fresh-install
+and both upgrade smoke tests run exactly the same check, after the probes. Any failure fails the smoke test and blocks publishing; the pages and
+the verdict stay in `brand/` and `brand.log` of the kept logs. `ionos-smoke-brand.sh --scan <pages folder> [<allow-list>]` runs only the text check.
+
+**Pages** (kept in `brand/pages/`): the login page, then with the login session the files page, admin settings, admin overview, personal settings,
+the user theming section (`/settings/user/theming`) and the admin theming section (`/settings/admin/theming`), and a sample system mail made by the
+real mail template of the instance (`ionos-smoke-mail.php`, run in the unpacked tree; it only renders, nothing is sent) as HTML and as text. The text of
+a page is its HTML with JSON slashes unescaped plus every `initial-state-*` value decoded (settings travel Base64 encoded in the page).
+The pages are the server-rendered HTML: text that the browser creates from JS bundles is not covered.
+
+**Brand check**: the text `Nextcloud` in any case, anywhere in a page, fails unless an entry of `ionos-smoke-brand-allowlist.txt` removes it first. An entry is
+`<page glob> :: <perl regexp, case sensitive> :: <reason>`; the regexps are removed from the text of the matching pages and everything left is reported with
+its page and context. Entries that match nothing are noticed as stale, a malformed entry or a regexp that matches the empty string fails the check. The
+shipped list was written from the real pages of the dev build (see "What the brand check found" below); its first entry is the permitted product name
+`IONOS Nextcloud Workspace`. Add an entry only after reading the page in `brand/pages/`, make it a whole attribute or phrase (never the bare word) and give a reason.
+
+**Theme probes** run only for what the archive and the resolved flavor say, so there is no per-flavor code:
+
+| Condition | Probe |
+| --- | --- |
+| `enforce_theme` in the resolved flavor | `occ config:system:get enforce_theme` equals it; the login page has `data-theme-<id>`; `/index.php/apps/theming/theme/<id>.css` answers 200 with the scope `[data-theme-<id>]` and `--color-primary:`; the theme list of the user theming section holds only that theme |
+| `app-config-special.json` of the archive sets theming `disable-user-theming` | the user theming section's initial state says `isUserThemingDisabled` is true (user controls gone) |
+| system setting `theme` is set (the legacy theme folder) | the admin theming section says `isThemeable` is false (admin controls gone: the theming app shows "already using a custom theme" instead of its settings) |
+| system setting `mail_template_class` is set | the sample mail was made by exactly that class |
+
+### The allow-list of the log check
 
 `ionos-smoke-log-allowlist.txt` has one extended regular expression (`grep -E`) per line, matched against the log
 message; blank lines and `#` lines are ignored. EVERY entry needs a comment above it that names the message, where it
@@ -235,6 +263,7 @@ A manual run of `IONOS build` with input `smoke_break` set to one of these tampe
 | `extra-app` | adds a valid app folder `apps/ionos_smoke_extra` | `app 'ionos_smoke_extra' is disabled but is not in the resolved flavor` |
 | `wrong-mode` | takes one `defaultEnabled` app out of `core/shipped.json` | `app '<id>' has mode default and must be enabled ... but it is disabled` |
 | `skip-enable` | empties the `ENABLE_APPS` list of the archive's `ncw-configure.sh` (needs a flavor with `enable_after_install`) | `app '<id>' has mode available and is listed in enable_after_install: it must be enabled ...` |
+| `brand` | appends the visible text `Nextcloud (added by ionos-smoke-break.sh)` to `core/templates/login.php` (it must end in HTML mode) | `brand check, page login: 1 occurrence(s) of the text "Nextcloud" outside the allow-list` |
 
 If the smoke test passes with a break, the run fails with "did not catch the break" (so a gate that proves nothing is a
 failure too). Scheduled runs have no such input and always use `none`; the tamper step also only runs for `workflow_dispatch`.
@@ -343,8 +372,33 @@ The same input as for the fresh-install test; each mode belongs to exactly one s
 | `removed-in-shipped` | puts the first app of `removed-apps.json` back into all three lists of `core/shipped.json` while its folder stays out of the tree: a flavor that forgot to remove an app | `occ upgrade` fails (exit 5): `The files of the app "firstrunwizard" were not correctly replaced before running the update` |
 | `no-buildnumber` | deletes `.buildnumber`, so the new tree has the old version and the upgrade has nothing to do | `after the upgrade the version is '33.0.9.1', expected '33.0.9.1.12' ... the upgrade did not take` |
 
-The fresh-install modes (`missing-app`, `extra-app`, `wrong-mode`, `skip-enable`) only break the fresh-install job. If an upgrade test passes with a break the
+The fresh-install modes (`missing-app`, `extra-app`, `wrong-mode`, `skip-enable`, `brand`) only break the fresh-install job. If an upgrade test passes with a break the
 run fails with "did not catch the break".
+
+### What the brand check and the theme probes showed (local run on a real install)
+
+The first IONOS theme, mail template and branding settings were run against the dev-v33.0.9.18 archive plus the patch and the flavor changes
+(SQLite, php 8.3.6, the real `ionos-smoke-run.sh`). Things the real server did that the design had not assumed:
+
+- **The theming app's autoloader is a classmap** (`apps/theming/composer`, `classmap-authoritative`), so a theme class copied to `apps/theming/lib/Themes`
+  is never found. The build copies theme classes to `lib/private/Ncw/Themes` and mail classes to `lib/private/Ncw/Mail` (namespaces `OC\Ncw\...`), which the
+  server's PSR-4 autoloader for `OC\` (not authoritative) loads.
+- **Theme classes outside `OCA\Theming` are built by the server container, not by the theming app's container**, which is the only one that knows an `IL10N`.
+  `IonosTheme` therefore takes the l10n factory. (The patch works as designed: before this fix the real log showed its one warning
+  `Ignoring theme from ncw.themes: Could not resolve OCP\IL10N!` and the existing `Enforced theme not found` error, and no page broke.)
+- **A dark variant by `@media` in `getCustomCss()` is silently dropped** by the theme stylesheet code (its regexp for at-rules needs an at-rule inside, so
+  `@media { selector { } }` fails and, for a long rule, exhausts `pcre.backtrack_limit` and drops every at-rule). The theme uses `light-dark()` values and
+  `color-scheme: light dark` instead. Limit: variables that hold a comma list (`--color-*-rgb`) cannot hold two values and stay light.
+- **`enforce_theme` with an extra theme** works: the list is default, dark, the enforced theme; the user theming section lists only the enforced theme.
+- **The `theme` system setting (legacy theme folder `themes/<name>/`) is the admin theming lock**: the theming app's admin page then shows only "You are
+  already using a custom theme" (`isThemeable` false) and the instance settings from `app-config.json` still apply. The server loads the folder's `core/l10n`, `lib/l10n`,
+  `apps/<app>/l10n` JSON files merged over its own, template overrides (`themes/<name>/apps/<app>/templates/...`, checked), CSS and images. The upgrade
+  code of `lib/base.php` blanks `theme` during the upgrade and restores it.
+- **`l10n/*.js` files of a theme replace the app's file** (the JS locator loads only the first it finds), so only the JSON (PHP-side) translations are overridden.
+- The defaults for the client download links and the iOS app id are Nextcloud's and show up in every page (`syncClientUrl`, the `apple-itunes-app` meta tag):
+  set by the base config `13-clients.config.php`.
+- Upstream marketing that remains on the personal settings page is the development notice template (social links); the AGPL attribution stays.
+  Its override is the source-link change; the matching allow-list entries say so.
 
 ### What the first runs on dev-v33.0.9.5 showed
 

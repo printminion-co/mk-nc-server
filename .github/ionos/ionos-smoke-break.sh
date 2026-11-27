@@ -9,6 +9,8 @@
 #   extra-app     add a valid app folder apps/ionos_smoke_extra that the flavor does not list
 #   wrong-mode    take one default app out of defaultEnabled in core/shipped.json, so it is installed disabled
 #   skip-enable   empty the ENABLE_APPS list of ncw-configure.sh, so the apps of enable_after_install stay disabled
+#   brand         add a visible "Nextcloud" text to the login page template (core/templates/login.php), so the brand
+#                 check of ionos-smoke-brand.sh finds text outside its allow-list on the login page
 # Modes for the UPGRADE smoke test (ionos-smoke-upgrade.sh; the fresh-install test leaves them alone):
 #   removed-in-shipped  the flavor "forgets" to remove an app: the first app of removed-apps.json is put back into all three
 #                       lists of core/shipped.json (alwaysEnabled, defaultEnabled, shippedApps), while its folder stays out
@@ -26,10 +28,10 @@ export LOG_PREFIX=ionos-smoke-break
 # shellcheck source=ionos-smoke-lib.sh
 . "$HERE/ionos-smoke-lib.sh"
 
-[ $# -ge 2 ] || die "usage: ionos-smoke-break.sh <none|missing-app|extra-app|wrong-mode|skip-enable|removed-in-shipped|no-buildnumber> <archive.zip>..."
+[ $# -ge 2 ] || die "usage: ionos-smoke-break.sh <none|missing-app|extra-app|wrong-mode|skip-enable|brand|removed-in-shipped|no-buildnumber> <archive.zip>..."
 MODE=$1
 shift
-case "$MODE" in none|missing-app|extra-app|wrong-mode|skip-enable|removed-in-shipped|no-buildnumber) ;; *) die "unknown mode '$MODE'" ;; esac
+case "$MODE" in none|missing-app|extra-app|wrong-mode|skip-enable|brand|removed-in-shipped|no-buildnumber) ;; *) die "unknown mode '$MODE'" ;; esac
 for a in "$@"; do [ -f "$a" ] || die "no archive at $a"; done
 # SMOKE_BREAK_JOB (fresh or upgrade): the smoke test the archives are for. A mode that belongs to the other smoke test is
 # not applied (the fresh-install job leaves an upgrade mode alone and the other way round), so exactly the test that
@@ -85,6 +87,17 @@ tamper() {
     ( cd "$TMP/edit" && zip -q "$ARCHIVE" ncw-configure.sh ) || die "could not write ncw-configure.sh to the archive"
     unzip -p "$ARCHIVE" ncw-configure.sh | grep -q '^ENABLE_APPS=()$' || die "ncw-configure.sh still lists apps to enable"
     log "skip-enable: emptied ENABLE_APPS in ncw-configure.sh" ;;
+  brand)
+    grep -qx 'core/templates/login.php' "$TMP/list" || die "the archive has no core/templates/login.php"
+    mkdir -p "$TMP/edit/core/templates"
+    unzip -p "$ARCHIVE" core/templates/login.php > "$TMP/edit/core/templates/login.php" || die "could not read core/templates/login.php"
+    # the template must end in HTML mode, so that the appended text is printed and is not PHP code
+    perl -0777 -ne 'exit(rindex($_, "?>") > rindex($_, "<?php") ? 0 : 1)' "$TMP/edit/core/templates/login.php" \
+      || die "core/templates/login.php does not end in HTML mode: the text cannot be appended"
+    printf '\n<p class="ionos-smoke-break">Nextcloud (added by ionos-smoke-break.sh)</p>\n' >> "$TMP/edit/core/templates/login.php"
+    ( cd "$TMP/edit" && zip -q "$ARCHIVE" core/templates/login.php ) || die "could not write core/templates/login.php to the archive"
+    unzip -p "$ARCHIVE" core/templates/login.php | grep -q 'ionos-smoke-break' || die "the archive does not hold the changed login template"
+    log "brand: added the text \"Nextcloud\" to core/templates/login.php" ;;
   removed-in-shipped)
     unzip -p "$ARCHIVE" removed-apps.json > "$TMP/removed.json" 2>/dev/null || die "the archive has no removed-apps.json"
     unzip -p "$ARCHIVE" core/shipped.json > "$TMP/shipped.json" 2>/dev/null || die "the archive has no core/shipped.json"

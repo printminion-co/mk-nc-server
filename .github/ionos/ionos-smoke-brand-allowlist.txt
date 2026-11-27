@@ -1,0 +1,46 @@
+# Allow-list of the brand check (ionos-smoke-brand.sh): the text "Nextcloud" may stay on a page only where an entry below
+# takes it out first. One entry per line:
+#
+#   <page glob> :: <perl regexp, case sensitive> :: <reason>
+#
+# The page is the name of the fetched page (login, files, settings, overview, personal, user-theming, admin-theming,
+# mail-html, mail-text). The text of a page is its HTML with JSON slashes unescaped (so "https://x", not "https:\/\/x")
+# and every initial-state value decoded. Keep the regexps as strict as the page allows: a whole attribute or phrase,
+# never the bare word. Every entry was found on a real install of the dev build (see ionos-build.md); an entry that
+# matches nothing is reported as a notice, so remove it. The known residual strings of 06-branding.md are listed
+# under "residual", everything else is allowed by the spec itself.
+
+# ---- the permitted product name (06-branding.md, "Name and trademark")
+* :: IONOS Nextcloud Workspace :: the product name, permitted by agreement with Nextcloud
+
+# ---- documentation URLs (07-validation.md allows them)
+* :: https://docs\.nextcloud\.com/server/33/go\.php\?to=[A-Za-z0-9-]+ :: documentation link, the page is addressed by the "to" parameter
+* :: "docBaseUrl":"https://docs\.nextcloud\.com" :: documentation base URL of the theming defaults (initial state and _theme)
+
+# ---- identifiers, not text a user reads
+* :: "nextcloud_announcements":"/apps-upstream/nextcloud_announcements" :: web path of the app nextcloud_announcements in the list of app roots (OC.appswebroots); an app id
+* :: id="nextcloud" :: the id of the header element of the page layout (CSS and JS hook)
+personal :: (?:settings-vue-settings|has-reasons-use|open-reasons-use)-nextcloud-pdf :: file name, initial-state id and element id of the "reasons to use" PDF feature of the settings app
+
+# ---- API data that is part of every page's initial state (capabilities)
+* :: "":"color is deprecated since Nextcloud 29, use primaryColor instead" :: comment text in the theming capabilities (API data, never shown)
+* :: "\$comment":"\\"blacklisted_files\\" is deprecated as of Nextcloud 30, use \\"forbidden_filenames\\" instead" :: comment text in the files capabilities (API data, never shown)
+* :: "Nextcloud (?:Account|Group|App)" :: names of the sharing source types sent by the circles app capabilities (hard-coded in the app, no translation)
+
+# ---- residual: strings the theme cannot reach (06-branding.md, "Known residuals")
+overview :: >Nextcloud Hub \d+ [A-Za-z]+</a> :: residual: the "Nextcloud Hub" label of the admin overview
+overview :: "updateServerURL":"https://updates\.nextcloud\.com/updater_server/" :: residual: the default update server of the updatenotification app (initial state of the admin overview)
+settings :: It requires Nextcloud Mail 4\.1 and an email account in Nextcloud Mail that matches the user's email address in Nextcloud\. :: residual: description of the mail provider setting, it names the separate Nextcloud Mail app
+user-theming :: Fluid \(Jo Myoung Hee - Nextcloud GmbH, CC-BY-SA-4\.0\) :: image attribution required by the license (CC-BY-SA) of a shipped background; the user theming controls are disabled
+user-theming :: Globe \(Jenna Kim - Nextcloud GmbH, CC-BY-SA-4\.0\) :: image attribution required by the license (CC-BY-SA) of a shipped background; the user theming controls are disabled
+user-theming :: "attribution_url":"https://nextcloud\.com/trademarks/" :: link of the image attributions above
+
+# ---- the development notice of the personal settings (template apps/settings/templates/settings/personal/development.notice.php)
+# The AGPL attribution stays; the social links are upstream marketing that the source-link override of the notice
+# (a theme template, 06-branding.md "Source offer") removes: take these entries out with it.
+personal :: <a href="https://nextcloud\.com/contribute" target="_blank" rel="noreferrer noopener">Nextcloud community</a>, the <a href="https://github\.com/nextcloud" target="_blank" rel="noreferrer noopener">source code</a> :: the AGPL attribution and source link of the development notice
+personal :: href="https://www\.facebook\.com/Nextclouders/" :: residual: social link of the development notice, to be removed by the source-link override
+personal :: href="https://bsky\.app/profile/nextcloud\.bsky\.social" :: residual: social link of the development notice, to be removed by the source-link override
+personal :: href="https://mastodon\.xyz/@nextcloud" :: residual: social link of the development notice, to be removed by the source-link override
+personal :: href="https://nextcloud\.com/blog/" :: residual: link of the development notice, to be removed by the source-link override
+personal :: href="https://newsletter\.nextcloud\.com/\?p=subscribe&amp;id=1" :: residual: link of the development notice, to be removed by the source-link override

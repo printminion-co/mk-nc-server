@@ -51,9 +51,9 @@ on:
         type: boolean
         default: false
       smoke_break:
-        description: 'Proof of the smoke gates: tamper with the archives before a smoke test, which must then fail and block publishing (manual runs only). missing-app, extra-app, wrong-mode and skip-enable break the fresh-install test; removed-in-shipped and no-buildnumber break the upgrade tests'
+        description: 'Proof of the smoke gates: tamper with the archives before a smoke test, which must then fail and block publishing (manual runs only). missing-app, extra-app, wrong-mode, skip-enable and brand break the fresh-install test; removed-in-shipped and no-buildnumber break the upgrade tests'
         type: choice
-        options: [none, missing-app, extra-app, wrong-mode, skip-enable, removed-in-shipped, no-buildnumber]
+        options: [none, missing-app, extra-app, wrong-mode, skip-enable, brand, removed-in-shipped, no-buildnumber]
         default: none
 
 permissions:

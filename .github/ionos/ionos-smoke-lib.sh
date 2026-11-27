@@ -56,7 +56,7 @@ smoke_free_port() {
 }
 
 # smoke_checks <tree> <log dir> <resolved.yaml> [<app list before the upgrade>]: serve the tree with `php -S` and run
-# the probes, cron.php, files:scan --all and the comparison of the app states with the RESOLVED flavor (after an
+# the probes, the brand check and the theme probes (ionos-smoke-brand.sh), cron.php, files:scan --all and the comparison of the app states with the RESOLVED flavor (after an
 # upgrade: with the states before it, see ionos-smoke-apps.sh). Every failure goes through `bad`.
 smoke_checks() {
   local tree=$1 dir=$2 resolved=$3 before=${4:-} port url up=false rc apps_args
@@ -76,6 +76,13 @@ smoke_checks() {
     if ! SMOKE_ADMIN_USER=$ADMIN_USER SMOKE_ADMIN_PASS=$ADMIN_PASS bash "$HERE/ionos-smoke-probes.sh" "$url" "$dir/probes" > "$dir/probes.log" 2>&1; then
       cat "$dir/probes.log" >&2; bad "probes failed, see probes.log"
     else cat "$dir/probes.log"; fi
+  fi
+
+  if [ "$up" = true ]; then
+    log "$FLAVOR: brand check and theme probes"
+    if ! PHP="$PHP" SMOKE_ADMIN_USER=$ADMIN_USER SMOKE_ADMIN_PASS=$ADMIN_PASS bash "$HERE/ionos-smoke-brand.sh" "$url" "$tree" "$resolved" "$dir/brand" > "$dir/brand.log" 2>&1; then
+      cat "$dir/brand.log" >&2; bad "the brand check or the theme probes failed, see brand.log"
+    else cat "$dir/brand.log"; fi
   fi
 
   log "$FLAVOR: cron.php"
@@ -105,7 +112,7 @@ smoke_log_check() {
 }
 
 # The modes of smoke_break (ionos-smoke-break.sh) and the smoke test each one is meant to make fail.
-SMOKE_BREAK_FRESH_MODES="missing-app extra-app wrong-mode skip-enable"
+SMOKE_BREAK_FRESH_MODES="missing-app extra-app wrong-mode skip-enable brand"
 SMOKE_BREAK_UPGRADE_MODES="removed-in-shipped no-buildnumber"
 # smoke_break_for <job: fresh|upgrade> <mode>: the mode when it is meant for this job, none otherwise (a mode never
 # touches the archives of a job it is not meant for, so that exactly the job that names it must fail)
