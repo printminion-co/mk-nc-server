@@ -336,7 +336,13 @@ brand_world() { # brand_world <name> [theme]: a tree, a resolved flavor and a st
     printf '%s\n' "$2" > "$BW/sysconf/enforce_theme"
     printf '%s\n' "$2" > "$BW/sysconf/theme"
     printf '%s\n' 'OC\Ncw\Mail\IonosEMailTemplate' > "$BW/sysconf/mail_template_class"
-    jq -nc '{class:"OC\\Ncw\\Mail\\IonosEMailTemplate",html:"<p>IONOS Nextcloud Workspace</p>",text:"mail IONOS Nextcloud Workspace"}' > "$BW/mail.json"
+    jq -nc --arg t "$2" '{class:"OC\\Ncw\\Mail\\IonosEMailTemplate",html:("<p>IONOS Nextcloud Workspace</p><img class=\"logo float-center\" src=\"http://logo.example.invalid/themes/" + $t + "/core/img/logo/logo.png?v=7\" alt=\"x\">"),text:"mail IONOS Nextcloud Workspace"}' > "$BW/mail.json"
+    # the theme images the archive carries, and the defaults of the server tree (different bytes)
+    local f
+    mkdir -p "$BW/tree/themes/$2/core/img/logo" "$BW/tree/core/img/logo"
+    for f in favicon.ico favicon-touch.png favicon-mask.svg manifest.json logo/logo.svg logo/logo.png; do
+      echo "theme $f" > "$BW/tree/themes/$2/core/img/$f"; echo "default $f" > "$BW/tree/core/img/$f"
+    done
     echo '[{"app":"theming","key":"disable-user-theming","value":"1","type":"boolean"}]' > "$BW/tree/app-config-special.json"
   fi
   cat > "$BW/bin/php" <<'STUB'
@@ -351,7 +357,7 @@ STUB
 }
 brand_run() { # brand_run <name> [VAR=value ...]: mock + brand script; the log is <name>.log
   local n=$1; shift
-  mock_start "$@"
+  mock_start MOCK_TREE="$BW/tree" "$@"
   run "$n" env PATH="$BW/bin:$PATH" PHP="$BW/bin/php" STUB_DIR="$BW" SMOKE_ADMIN_USER=admin SMOKE_ADMIN_PASS=Smoke-Pass SMOKE_BRAND_ALLOWLIST="$FIX/brand-allow.txt" \
     bash "$HERE/ionos-smoke-brand.sh" "$MOCK_URL" "$BW/tree" "$BW/resolved.yaml" "$BW/out"
 }
@@ -363,12 +369,13 @@ sc_brand_run() {
   check "the pages and the mail are kept" bash -c "ls '$BW/out/pages' | tr '\n' ' ' | grep -q 'admin-theming.html files.html login.html mail-html.html mail-text.txt overview.html personal.html settings.html user-theming.html'"
   check "no theme probe runs for a flavor without enforce_theme" bash -c "! grep -qiE 'enforce_theme|theme stylesheet|data-theme' '$ROOT/d1.log'"
   check "the settings the flavor does not set are not probed (no lock, no mail class)" bash -c "! grep -qiE 'locked|mail uses|user theming is disabled' '$ROOT/d1.log'"
+  check "no logo probe runs for a flavor without a theme folder" bash -c "! grep -qiE 'theme folder|logo' '$ROOT/d1.log'"
 
   brand_world bw2 ionos
   brand_run d2 MOCK_THEME=ionos
   check "a flavor with an enforced theme, locks and a mail class: every probe passes" test "$(status d2)" = 0
   local p
-  for p in "enforce_theme is ionos" "the login page carries data-theme-ionos" "theme stylesheet of ionos" "only the enforced theme" "user theming is disabled" "admin theming is locked" "system mail uses the template"; do
+  for p in "enforce_theme is ionos" "the login page carries data-theme-ionos" "theme stylesheet of ionos" "only the enforced theme" "user theming is disabled" "admin theming is locked" "system mail uses the template" "login favicon: favicon.ico is served from the theme folder" "login touch icon: favicon-touch.png" "login mask icon: favicon-mask.svg" "login web manifest: manifest.json" "login og:image: favicon-touch.png" "login and header logo (--image-logo): logo/logo.svg" "header logo (--image-logoheader): logo/logo.svg" "mail logo: logo/logo.png"; do
     check "probe reported: $p" grep -q -- "ok - .*$p" "$ROOT/d2.log"
   done
 
@@ -402,6 +409,27 @@ case "$(basename "$1")" in occ) exit 0 ;; *) echo oops >&2; exit 1 ;; esac
 STUB
   brand_run d12 MOCK_THEME=ionos
   check "a sample mail that cannot be made fails the run" bash -c "test '$(status d12)' != 0 && grep -q 'FAIL - sample mail' '$ROOT/d12.log'"
+  # the logo and icon probes: what the instance hands out must be the theme's file, byte for byte
+  local lc
+  for lc in "MOCK_FAVICON=/core/img/favicon.ico:login favicon: .*does not point into the theme folder" \
+            "MOCK_ICON_PATH=/themes/other/core/img:login touch icon: .*does not point into the theme folder" \
+            "MOCK_LOGO=/core/img/logo/logo.svg:login and header logo .*: .*does not point into the theme folder" \
+            "MOCK_FAIL=logo404:login favicon: .*answers HTTP 404" \
+            "MOCK_FAIL=logobytes:mail logo: .*not byte-identical"; do
+    brand_world bw15 ionos; brand_run d15 MOCK_THEME=ionos "${lc%%:*}"
+    check "a logo or icon that is not the theme's fails the run (${lc%%:*})" test "$(status d15)" != 0
+    check "the failure is named (${lc%%:*})" said_re d15 "FAIL - ${lc#*:}"
+  done
+  brand_world bw16 ionos; cp "$BW/tree/core/img/logo/logo.png" "$BW/tree/themes/ionos/core/img/logo/logo.png"; brand_run d16 MOCK_THEME=ionos
+  check "a theme image that is the Nextcloud default fails" bash -c "test '$(status d16)' != 0 && grep -q 'FAIL - mail logo: .*is the Nextcloud default' '$ROOT/d16.log'"
+  brand_world bw17 ionos; rm "$BW/tree/themes/ionos/core/img/logo/logo.png"; brand_run d17 MOCK_THEME=ionos
+  check "a logo the archive does not carry fails" bash -c "test '$(status d17)' != 0 && grep -q 'FAIL - mail logo: .*the archive has no themes/ionos/core/img/logo/logo.png' '$ROOT/d17.log'"
+  brand_world bw18 ionos; jq -nc '{class:"OC\\Ncw\\Mail\\IonosEMailTemplate",html:"<p>no logo</p>",text:"x"}' > "$BW/mail.json"; brand_run d18 MOCK_THEME=ionos
+  check "a mail without a logo image fails" bash -c "test '$(status d18)' != 0 && grep -q 'FAIL - mail logo: no such link' '$ROOT/d18.log'"
+  brand_world bw19 ionos; brand_run d19 MOCK_THEME=ionos MOCK_ICON_PATH=/nc/themes/ionos/core/img
+  check "a web root in front of the theme path is fine" bash -c "test '$(status d19)' = 0 && grep -q 'ok - login favicon' '$ROOT/d19.log'"
+  brand_world bw20 ionos; rm -rf "$BW/tree/themes/ionos/core"; mkdir -p "$BW/tree/themes/ionos/css"; brand_run d20 MOCK_THEME=ionos
+  check "a theme folder without images is not probed for logos" bash -c "test '$(status d20)' = 0 && ! grep -q 'theme folder' '$ROOT/d20.log'"
   brand_world bw13; brand_run d13 MOCK_FAIL=settings
   check "a page that does not answer fails the run" bash -c "test '$(status d13)' != 0 && grep -q 'FAIL - page settings' '$ROOT/d13.log'"
   mock_stop
@@ -968,7 +996,14 @@ if ($uri === '/status.php') {
         if ($okLogin) { setcookie('mocksession', 'ok'); header('Location: /index.php/apps/dashboard/', true, 303); }
         else { header('Location: /index.php/login?user=admin&direct=1', true, 303); }
     } elseif ($fail === 'login') { http_response_code(500); echo 'boom'; }
-    else { $page('login'); }
+    else {
+        $ip = getenv('MOCK_ICON_PATH') ?: "/themes/$theme/core/img";
+        $icons = $theme === '' ? '' : '<link rel="icon" href="' . (getenv('MOCK_FAVICON') ?: "$ip/favicon.ico") . '">'
+            . '<link rel="apple-touch-icon" href="' . $ip . '/favicon-touch.png"><link rel="mask-icon" sizes="any" href="' . $ip . '/favicon-mask.svg" color="#2F5D9E">'
+            . '<link rel="manifest" href="' . $ip . '/manifest.json" crossorigin="use-credentials">'
+            . '<meta property="og:image" content="http://logo.example.invalid' . $ip . '/favicon-touch.png"/>';
+        $page('login', $icons);
+    }
 } elseif (str_starts_with($uri, '/ocs/v2.php/cloud/capabilities')) {
     header('Content-Type: application/json');
     if (!$basic || ($_SERVER['HTTP_OCS_APIREQUEST'] ?? '') !== 'true') { http_response_code(401); echo '{}'; return; }
@@ -990,7 +1025,13 @@ if ($uri === '/status.php') {
 } elseif (preg_match('#^/index\.php/apps/theming/theme/([a-z0-9-]+)\.css$#', $uri, $m)) {
     if ($fail === 'css') { http_response_code(404); echo '<!DOCTYPE html>'; return; }
     header('Content-Type: text/css');
-    echo $fail === 'cssbody' ? 'body { color: red }' : "[data-theme-{$m[1]}] { --color-primary:#123456; }";
+    $logo = getenv('MOCK_LOGO') ?: "/themes/{$m[1]}/core/img/logo/logo.svg";
+    echo $fail === 'cssbody' ? 'body { color: red }' : "[data-theme-{$m[1]}] { --color-primary:#123456; --image-background:none; --image-logo:url('$logo'); --image-logoheader:url('$logo'); }";
+} elseif (preg_match('#^(?:/nc)?(/themes/[a-z0-9-]+/core/img/.+)$#', $uri, $m)) {
+    // the static files of the unpacked tree
+    $file = getenv('MOCK_TREE') . $m[1];
+    if ($fail === 'logo404' || !is_file($file)) { http_response_code(404); echo 'not found'; return; }
+    echo file_get_contents($file) . ($fail === 'logobytes' ? 'tampered' : '');
 } elseif (in_array($uri, ['/index.php/apps/files/', '/index.php/settings/admin', '/index.php/settings/admin/overview', '/index.php/settings/user', '/index.php/settings/user/theming', '/index.php/settings/admin/theming'], true)) {
     if (!$session) { http_response_code(401); echo 'login required'; return; }
     $key = ['/index.php/apps/files/' => 'files', '/index.php/settings/admin' => 'settings', '/index.php/settings/admin/overview' => 'overview',

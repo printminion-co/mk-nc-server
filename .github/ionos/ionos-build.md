@@ -236,6 +236,17 @@ shipped list was written from the real pages of the dev build (see "What the bra
 | `app-config-special.json` of the archive sets theming `disable-user-theming` | the user theming section's initial state says `isUserThemingDisabled` is true (user controls gone) |
 | system setting `theme` is set (the legacy theme folder) | the admin theming section says `isThemeable` is false (admin controls gone: the theming app shows "already using a custom theme" instead of its settings) |
 | system setting `mail_template_class` is set | the sample mail was made by exactly that class |
+| the unpacked archive has images in `themes/<theme>/core/img/` (`<theme>` = the system setting `theme`) | the logo and icon URLs the instance hands out point into that folder, answer 200 and are byte-identical (sha256) to the archive's file, and are not a copy of the Nextcloud default of the same name (see "Logo probes") |
+
+**Logo probes.** Each URL is taken from what the instance really sends, not built by the script, so a link that falls back to the Nextcloud default
+fails: the `icon`, `apple-touch-icon`, `mask-icon` and `manifest` links and the `og:image` meta of the login page; the `--image-logo` and
+`--image-logoheader` variables of `/index.php/apps/theming/theme/<enforced theme>.css` (the logo of the login page and of the header: on 33 the theming app
+defines them only for an uploaded logo, otherwise the server CSS loads the fixed `core/img/logo/logo.svg`, which the theme folder cannot replace, so the
+theme class has to define them); and the `<img class="logo">` of the sample mail (`logo/logo.png`). The path of a URL must match
+`.../themes/<theme>/core/img/<file>` (a web root in front is fine, and a mail URL is fetched from the base URL of the smoke test, not its own host), the
+file is fetched and compared with `themes/<theme>/core/img/<file>` of the unpacked tree, then with `core/img/<file>`. A theme folder without
+`core/img` is not probed. Failures: `FAIL - login favicon: ... does not point into the theme folder`, `answers HTTP 404`, `not byte-identical`,
+`is the Nextcloud default`.
 
 ### The allow-list of the log check
 
@@ -394,6 +405,12 @@ The first IONOS theme, mail template and branding settings were run against the 
   already using a custom theme" (`isThemeable` false) and the instance settings from `app-config.json` still apply. The server loads the folder's `core/l10n`, `lib/l10n`,
   `apps/<app>/l10n` JSON files merged over its own, template overrides (`themes/<name>/apps/<app>/templates/...`, checked), CSS and images. The upgrade
   code of `lib/base.php` blanks `theme` during the upgrade and restores it.
+- **Images: the theme folder wins only where the server looks an image up with `imagePath`** (`themes/<theme>/core/img/<file>` before `core/img/<file>`; the 33
+  names are `logo/logo.svg`, `logo/logo.png`, `favicon.ico`, `favicon-touch.png`, `favicon-fb.png`, `favicon-mask.svg`, `manifest.json`). It does not apply to the
+  `url()` fallbacks of the CSS (login and header logo: `--image-logo` must be defined by the theme class) nor to `favicon.png`, `favicon.svg`, `favicon-touch.svg`
+  and the generated icons of the `/apps/theming/{favicon,icon,manifest}` routes (a theme `manifest.json` replaces the route for every page). The
+  `logo-mail.png`, `logo-icon-175px.png` and `logo-enterprise.*` files of `core/img/logo` are not used by any 33 code. Checked on a real install of the dev
+  build with the dummy logo set (the logo probes above).
 - **`l10n/*.js` files of a theme replace the app's file** (the JS locator loads only the first it finds), so only the JSON (PHP-side) translations are overridden.
 - The defaults for the client download links and the iOS app id are Nextcloud's and show up in every page (`syncClientUrl`, the `apple-itunes-app` meta tag):
   set by the base config `13-clients.config.php`.

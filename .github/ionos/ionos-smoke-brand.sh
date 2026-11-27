@@ -25,6 +25,12 @@
 #    - the system setting `theme` is set (the legacy theme folder): the admin theming section says the instance is not
 #      themeable (admin controls gone)
 #    - the system setting mail_template_class is set: the sample mail was made by exactly that class
+#    - the unpacked archive has a theme folder with images (themes/<theme>/core/img, <theme> = the system setting
+#      `theme`): the logo and icon URLs the instance really hands out must point into that folder, answer 200 and be
+#      byte-identical (sha256) to the file of the archive, and must not be the Nextcloud default of the same name. The
+#      URLs: the favicon, touch icon, mask icon, web manifest and og:image links of the login page, the --image-logo
+#      and --image-logoheader variables of the stylesheet of the enforced theme (they make the logo of the login page
+#      and of the header), and the logo of the sample mail
 # Every probe runs; each prints "ok - <name>" or an ::error:: line "FAIL - <name>: <why>"; the exit status is 1 when
 # one failed or the brand check found a text.
 # Environment: SMOKE_ADMIN_USER, SMOKE_ADMIN_PASS, PHP (default php), SMOKE_BRAND_ALLOWLIST (default: the file next to this script).
@@ -261,6 +267,63 @@ if [ -n "$mail_class" ]; then
     if [ "$got" = "$mail_class" ]; then pass "system mail uses the template $mail_class"
     else miss "mail template" "the sample mail was made by '$got', mail_template_class is '$mail_class'"; fi
   else miss "mail template" "no sample mail to check"; fi
+fi
+
+# ---- the logo and icon probes
+# unescape_html: the few entities that matter in an attribute value
+unescape_html() { sed 's/&amp;/\&/g; s/&#0*39;/'"'"'/g; s/&quot;/"/g'; }
+# link_href <file> <rel>: the href of the first <link rel="<rel>">
+link_href() { REL=$2 perl -0777 -ne 'if (/<link\b[^>]*\brel="\Q$ENV{REL}\E"[^>]*\bhref="([^"]*)"/s || /<link\b[^>]*\bhref="([^"]*)"[^>]*\brel="\Q$ENV{REL}\E"/s) { print $1 }' "$1" | unescape_html; }
+# og_image <file>: the content of <meta property="og:image">
+og_image() { perl -0777 -ne 'print $1 if /<meta\b[^>]*\bproperty="og:image"[^>]*\bcontent="([^"]*)"/s' "$1" | unescape_html; }
+# css_var_url <file> <variable>: the url() of a CSS variable
+css_var_url() { VAR=$2 perl -0777 -ne 'print $1 if /\Q$ENV{VAR}\E:\s*url\(\s*[\x27"]?([^\x27")]*)/' "$1"; }
+# mail_logo <file>: the src of the logo image of the mail
+mail_logo() { perl -0777 -ne 'print $1 if /<img\b[^>]*\bclass="logo[^"]*"[^>]*\bsrc="([^"]*)"/s' "$1" | unescape_html; }
+
+ORIGIN=$(sed -E 's#^(https?://[^/]+).*#\1#' <<<"$BASE")
+sha() { sha256sum "$1" | cut -d' ' -f1; }
+
+# probe_theme_image <name> <url> <theme folder>: the url must point into themes/<theme>/core/img/, answer 200 and
+# hold the bytes of the file of the archive, which is not a copy of the Nextcloud default of the same name
+probe_theme_image() {
+  local name=$1 url=$2 theme=$3 path rel file served code
+  if [ -z "$url" ]; then miss "$name" "no such link or value found"; return; fi
+  path=$url
+  if [[ $url == *://* ]]; then path=/${url#*://*/}; fi
+  path=${path%%[?#]*}
+  if [[ ! $path =~ /themes/$theme/core/img/(.+)$ ]]; then
+    miss "$name" "$url does not point into the theme folder themes/$theme/core/img/ (the default image of the server)"; return
+  fi
+  rel=${BASH_REMATCH[1]}
+  file="$TREE/themes/$theme/core/img/$rel"
+  if [ ! -f "$file" ]; then miss "$name" "$url: the archive has no themes/$theme/core/img/$rel"; return; fi
+  served="$OUT/logo-probes/$(echo "$rel" | tr '/' '_')"
+  code=$(req "$served" "$ORIGIN$path")
+  if [ "$code" != 200 ]; then miss "$name" "$ORIGIN$path answers HTTP $code, wanted 200"; return; fi
+  if [ "$(sha "$served")" != "$(sha "$file")" ]; then miss "$name" "$ORIGIN$path is not byte-identical to themes/$theme/core/img/$rel of the archive"; return; fi
+  if [ -f "$TREE/core/img/$rel" ] && [ "$(sha "$served")" = "$(sha "$TREE/core/img/$rel")" ]; then
+    miss "$name" "$ORIGIN$path is the Nextcloud default core/img/$rel"; return
+  fi
+  pass "$name: $rel is served from the theme folder (200, sha256 $(sha "$served" | cut -c1-12))"
+}
+
+if [ -n "$theme_dir" ] && [[ $theme_dir =~ ^[A-Za-z0-9_-]+$ ]] && [ -n "$(find "$TREE/themes/$theme_dir/core/img" -type f 2>/dev/null | head -n1)" ]; then
+  mkdir -p "$OUT/logo-probes"
+  if [ -f "$PAGES/login.html" ]; then
+    probe_theme_image "login favicon" "$(link_href "$PAGES/login.html" icon)" "$theme_dir"
+    probe_theme_image "login touch icon" "$(link_href "$PAGES/login.html" apple-touch-icon)" "$theme_dir"
+    probe_theme_image "login mask icon" "$(link_href "$PAGES/login.html" mask-icon)" "$theme_dir"
+    probe_theme_image "login web manifest" "$(link_href "$PAGES/login.html" manifest)" "$theme_dir"
+    probe_theme_image "login og:image" "$(og_image "$PAGES/login.html")" "$theme_dir"
+  else miss "login icons" "no login page to check"; fi
+  if [ -f "$OUT/theme.css" ] && [ -n "$enforced" ]; then
+    probe_theme_image "login and header logo (--image-logo)" "$(css_var_url "$OUT/theme.css" --image-logo)" "$theme_dir"
+    probe_theme_image "header logo (--image-logoheader)" "$(css_var_url "$OUT/theme.css" --image-logoheader)" "$theme_dir"
+  else miss "logo variables" "no stylesheet of an enforced theme to read --image-logo from"; fi
+  if [ -f "$PAGES/mail-html.html" ]; then
+    probe_theme_image "mail logo" "$(mail_logo "$PAGES/mail-html.html")" "$theme_dir"
+  else miss "mail logo" "no sample mail to check"; fi
 fi
 
 rm -f "$JAR"
