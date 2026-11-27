@@ -16,7 +16,8 @@ and the job fails at the end when any step failed.
    `merge-upstream` endpoint. That only fast-forwards: a diverged mirror (HTTP 409) is never forced,
    the run fails and a person looks at it. When upstream touches workflow files, this step may also
    need the token below.
-2. **Disabling upstream's workflows.** Every active workflow whose file is under `.github/workflows/`
+2. **Disabling upstream's workflows** (`disable_upstream_workflows` in `ionos-lib.sh`, shared with
+   `ionos-app-pins.sh`, which calls it before it opens a pull request). Every active workflow whose file is under `.github/workflows/`
    and does not start with `ionos-` is disabled (upstream's files stay untouched, so they never
    conflict on a rebase; new ones are caught by the next run). Dynamic workflows (path outside
    `.github/workflows/`, such as `pages-build-deployment`) are skipped. A 4xx answer for one workflow

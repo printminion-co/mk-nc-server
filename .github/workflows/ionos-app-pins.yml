@@ -28,7 +28,10 @@ on:
         type: string
         required: false
 
+# actions: write lets the default-token fallback disable upstream workflows (the sync token carries its own
+# Actions scope; a personal access token is not limited by this block)
 permissions:
+  actions: write
   contents: write
   pull-requests: write
 

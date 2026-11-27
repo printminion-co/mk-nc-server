@@ -66,3 +66,32 @@ base_release_of() {
 
 # True when <path> (relative to the checkout) is a submodule of the commit checked out in <root>.
 is_gitlink() { git -C "$1" ls-tree HEAD -- "$2" | grep -q '^160000 '; }
+
+# Upstream's workflow files stay untouched in the fork (deleting them would conflict on every rebase);
+# instead every active workflow outside our ionos- prefix is disabled. Workflows that upstream adds later
+# are caught by the next call. Used by ionos-sync.sh (daily) and ionos-app-pins.sh (before it opens a
+# pull request, so that a pull request can never start an upstream workflow).
+# Needs REPO (owner/name) and optionally DRY_RUN=true (print "would: ...", change nothing). A 4xx on one
+# workflow is a warning and the others are still handled; any other failure makes the function return 1.
+disable_upstream_workflows() {
+  local id path list err failed=0
+  # only real workflow files: dynamic workflows (for example pages-build-deployment) have a
+  # path outside .github/workflows/ and cannot be disabled this way
+  list="$(gh_paginate '.workflows[] | select(.state == "active")
+             | select(.path | startswith(".github/workflows/"))
+             | select(.path | startswith(".github/workflows/ionos-") | not) | [.id, .path] | @tsv' \
+             "repos/${REPO}/actions/workflows?per_page=100")" || return 1
+  while IFS=$'\t' read -r id path; do
+    [ -n "$id" ] || continue
+    if [ "${DRY_RUN:-false}" = true ]; then
+      log "[dry run] would: disable workflow ${path} (${id})"
+    elif err="$(gh api -X PUT "repos/${REPO}/actions/workflows/${id}/disable" 2>&1 >/dev/null)"; then
+      log "workflows: disabled ${path}"
+    elif [[ "$err" == *"HTTP 4"* ]]; then
+      warn "workflow ${path} (${id}) could not be disabled, continuing: ${err}"
+    else
+      echo "::error::${LOG_PREFIX}: disabling workflow ${path} (${id}) failed: ${err}"; failed=1
+    fi
+  done <<<"$list"
+  return "$failed"
+}

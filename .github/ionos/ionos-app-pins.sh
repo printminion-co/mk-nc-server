@@ -87,6 +87,11 @@ base_release_of_dev_branch() {
   die "no final release tag of line $LINE is an ancestor of $BASE_BRANCH"
 }
 
+# 0. Disable upstream's workflows BEFORE anything is created: GitHub lists them lazily after the default
+#    branch is switched, and a pull request would start them. Done on every real run (also when the pins
+#    already match): cheap and idempotent. Needs "actions: write" (the sync token has it).
+disable_upstream_workflows || die "could not disable upstream's workflows; nothing was created"
+
 # 1. The tip of the dev branch, and which release tag to pin for
 TIP=$(gh api -X GET "repos/$REPO/commits" -f sha="$BASE_BRANCH" -f per_page=1) || die "cannot read branch $BASE_BRANCH of $REPO"
 BASE_SHA=$(jq -r '.[0].sha // empty' <<<"$TIP")

@@ -31,6 +31,15 @@ T10=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 make_stub() {
   mkdir -p "$T/bin" "$T/fx" "$T/log" "$T/state"
   echo '[]' >"$T/state/pulls.json"
+  # upstream workflows are still active when the pull request event fires (GitHub lists them lazily)
+  cat >"$T/state/workflows.json" <<'JSON'
+{"workflows":[
+ {"id":1,"path":".github/workflows/cypress.yml","state":"active"},
+ {"id":2,"path":".github/workflows/ionos-build.yml","state":"active"},
+ {"id":3,"path":"dynamic/pages/pages-build-deployment","state":"active"},
+ {"id":4,"path":".github/workflows/lint-php.yml","state":"disabled_manually"}
+]}
+JSON
   cat >"$T/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 # Stub gh: only `gh api <endpoint> [-X M] [-f k=v] [--input -] [-H h] [--paginate]`.
@@ -79,6 +88,7 @@ key=$path
 [ -n "${F[sha]:-}" ] && key+="?sha=${F[sha]}"
 [ -n "${F[ref]:-}" ] && key+="?ref=${F[ref]}"
 if [ "$method" = GET ]; then
+  if [ "$path" = "repos/$R/actions/workflows" ]; then cat "$S/workflows.json"; exit 0; fi
   if [ "$path" = "repos/$R/pulls" ]; then
     jq -c --arg h "${F[head]:-}" --arg b "${F[base]:-}" --arg s "${F[state]:-open}" \
       '[.[] | select(.state == $s and .head_label == $h and .base == $b) | {number}]' "$S/pulls.json"
@@ -96,6 +106,11 @@ fi
 S="$STUB_DIR/state"
 sha=$(printf '%s' "$body" | sha1)
 case "$method $path" in
+  "PUT repos/$R/actions/workflows/"*/disable)
+    id=${path#repos/$R/actions/workflows/}; id=${id%/disable}
+    code=$(jq -r --argjson id "$id" '[.workflows[]|select(.id==$id).deny]|first // empty' "$S/workflows.json")
+    if [ -n "$code" ]; then echo "{\"message\":\"denied\"}"; echo "gh: denied (HTTP $code)" >&2; exit 1; fi
+    jq --argjson id "$id" '(.workflows[]|select(.id==$id)).state = "disabled_manually"' "$S/workflows.json" >"$S/w.tmp" && mv "$S/w.tmp" "$S/workflows.json" ;;
   "POST repos/$R/git/blobs") mkdir -p "$S/blobs"; printf '%s' "$body" >"$S/blobs/$sha"; echo "{\"sha\":\"$sha\"}" ;;
   "POST repos/$R/git/trees")
     # the real API resolves base_tree plus entries into a full tree: do the same for the two
@@ -231,7 +246,7 @@ run_script() { # extra env as args; sets OUT and RC
 }
 
 # State the stub holds after a run
-written() { { find "$T/state" -type f ! -name refs ! -name pulls.jsonl ! -name pulls.json ! -name p.tmp ! -name 'reads.*'; cat "$T/state/refs" "$T/state/pulls.jsonl" 2>/dev/null; } | wc -l; }
+written() { { find "$T/state" -type f ! -name refs ! -name pulls.jsonl ! -name pulls.json ! -name p.tmp ! -name 'reads.*' ! -name workflows.json ! -name w.tmp; cat "$T/state/refs" "$T/state/pulls.jsonl" 2>/dev/null; } | wc -l; }
 branch_sha() { awk -v r="refs/heads/$1" '$1 == r { s = $2 } END { print s }' "$T/state/refs" 2>/dev/null; }
 branch_commit() { cat "$T/state/commits/$(branch_sha "$1")" 2>/dev/null; }
 branch_tree() { cat "$T/state/trees/$(branch_commit "$1" | jq -r .tree)" 2>/dev/null; }
@@ -459,6 +474,59 @@ test_error_messages_say_what_failed() {
   assert_contains "app list: gh's message is shown" "$OUT" "stub failure (HTTP 500)"
 }
 
+wf_state() { jq -r --argjson id "$1" '.workflows[]|select(.id==$id).state' "$T/state/workflows.json"; }
+# the number of the first stub call that matches a pattern (calls are numbered in order)
+first_call() { grep -l -e "$1" "$T"/log/call.* 2>/dev/null | sed 's/.*call\.//' | sort -n | head -1; }
+
+test_upstream_workflows_are_disabled_before_the_pull_request() {
+  echo "upstream workflows are disabled before anything is created, on every real run"
+  scenario
+  run_script
+  assert_eq "exit code" "$RC" 0
+  assert_eq "an active upstream workflow is disabled" "$(wf_state 1)" disabled_manually
+  assert_eq "an ionos- workflow stays active" "$(wf_state 2)" active
+  assert_eq "a dynamic workflow is left alone" "$(wf_state 3)" active
+  assert_eq "an already disabled workflow stays so" "$(wf_state 4)" disabled_manually
+  assert_eq "the disabling came before the branch was created" \
+    "$([ "$(first_call 'PUT repos/ionos/nc/actions/workflows/1/disable')" -lt "$(first_call 'POST repos/ionos/nc/git/refs')" ] && echo yes)" yes
+  assert_eq "and before the pull request was opened" \
+    "$([ "$(first_call 'PUT repos/ionos/nc/actions/workflows/1/disable')" -lt "$(first_call 'POST repos/ionos/nc/pulls')" ] && echo yes)" yes
+  scenario
+  seed_branch app-pins/v33.0.10 cafe0009 a_one="$OLD1" b_two="$SAME"
+  run_script
+  assert_eq "a stale branch is refreshed only after the disabling" \
+    "$([ "$(first_call 'PUT repos/ionos/nc/actions/workflows/1/disable')" -lt "$(first_call 'PATCH repos/ionos/nc/git/refs')" ] && echo yes)" yes
+  scenario
+  tag_ref v33.0.10 a_one "$OLD1"
+  run_script
+  assert_contains "nothing to do" "$OUT" "already match"
+  assert_eq "even a run with nothing to do disables them (cheap and idempotent)" "$(wf_state 1)" disabled_manually
+  scenario
+  run_script
+  run_script
+  assert_eq "a second run is a no-op for workflows" "$(grep -c 'PUT repos/ionos/nc/actions/workflows' "$T"/log/call.* | awk -F: '{n+=$2} END {print n}')" 1
+}
+
+test_workflow_disabling_dry_run_and_failures() {
+  echo "dry run changes nothing; a 4xx warns and continues; another failure stops before anything is created"
+  scenario
+  run_script DRY_RUN=true
+  assert_eq "dry run leaves the workflow active" "$(wf_state 1)" active
+  assert_contains "dry run says what it would do" "$OUT" "would: disable workflow .github/workflows/cypress.yml"
+  scenario
+  jq '(.workflows[]|select(.id==1)).deny = 403 | .workflows += [{"id":5,"path":".github/workflows/block-merge.yml","state":"active"}]' "$T/state/workflows.json" >"$T/state/w.tmp" && mv "$T/state/w.tmp" "$T/state/workflows.json"
+  run_script
+  assert_eq "a 4xx on one workflow does not fail the run" "$RC" 0
+  assert_contains "the 4xx is a warning" "$OUT" "::warning::"
+  assert_eq "the other workflow is still disabled" "$(wf_state 5)" disabled_manually
+  assert_eq "the pull request is still opened" "$(pulls | wc -l)" 1
+  scenario
+  jq '(.workflows[]|select(.id==1)).deny = 500' "$T/state/workflows.json" >"$T/state/w.tmp" && mv "$T/state/w.tmp" "$T/state/workflows.json"
+  run_script
+  assert_fails "a failure other than 4xx fails the run"
+  assert_eq "and nothing was created" "$(written)" 0
+}
+
 test_app_set_change_updates_gitmodules() {
   echo "app set changed: .gitmodules is part of the commit, removed app dropped"
   scenario
@@ -533,7 +601,7 @@ test_token_warning() {
   assert_not_contains "no warning with the secret" "$OUT" "IONOS_SYNC_TOKEN"
 }
 
-for t in test_upstream_reads_use_the_read_token test_error_messages_say_what_failed test_pins_differ_opens_one_pull_request test_base_is_the_release_of_the_dev_branch \
+for t in test_upstream_workflows_are_disabled_before_the_pull_request test_workflow_disabling_dry_run_and_failures test_upstream_reads_use_the_read_token test_error_messages_say_what_failed test_pins_differ_opens_one_pull_request test_base_is_the_release_of_the_dev_branch \
   test_base_moves_after_promotion test_no_ancestor_tag_fails test_pins_equal_does_nothing \
   test_second_run_is_idempotent test_existing_branch_with_same_pins_does_nothing \
   test_existing_branch_with_stale_pins_is_refreshed test_branch_moved_meanwhile_is_not_overwritten test_existing_branch_with_open_pull_request_is_left \

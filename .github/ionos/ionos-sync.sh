@@ -216,32 +216,6 @@ make_candidate() {
   fi
 }
 
-# Upstream's workflow files stay untouched in the fork (deleting them would conflict on every
-# rebase); instead every active workflow outside our ionos- prefix is disabled. Workflows that
-# upstream adds later are caught by the next run.
-disable_upstream_workflows() {
-  local id path list err failed=0
-  # only real workflow files: dynamic workflows (for example pages-build-deployment) have a
-  # path outside .github/workflows/ and cannot be disabled this way
-  list="$(gh_paginate '.workflows[] | select(.state == "active")
-             | select(.path | startswith(".github/workflows/"))
-             | select(.path | startswith(".github/workflows/ionos-") | not) | [.id, .path] | @tsv' \
-             "repos/${REPO}/actions/workflows?per_page=100")"
-  while IFS=$'\t' read -r id path; do
-    [ -n "$id" ] || continue
-    if is_dry_run; then
-      would "disable workflow ${path} (${id})"
-    elif err="$(gh api -X PUT "repos/${REPO}/actions/workflows/${id}/disable" 2>&1 >/dev/null)"; then
-      log "workflows: disabled ${path}"
-    elif [[ "$err" == *"HTTP 4"* ]]; then
-      warn "workflow ${path} (${id}) could not be disabled, continuing: ${err}"
-    else
-      echo "::error::ionos-sync: disabling workflow ${path} (${id}) failed: ${err}"; failed=1
-    fi
-  done <<<"$list"
-  return "$failed"
-}
-
 # Mirrors move only by fast-forward: GitHub's merge-upstream endpoint refuses (HTTP 409) when the
 # branch has diverged. That is never forced; the run fails so that a person looks at it.
 sync_mirrors() {

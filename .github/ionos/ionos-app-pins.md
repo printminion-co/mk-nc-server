@@ -124,6 +124,14 @@ meanwhile (a best-effort lease).
 anything else stops the run. Branch names and refs are passed as query parameters, not concatenated
 into URLs.
 
+**Upstream workflows are disabled first.** Before it creates or refreshes a branch or opens a pull request
+(and also on runs where the pins already match: cheap and idempotent), the helper disables every active
+workflow outside the `ionos-` prefix, with the same function as `ionos-sync.sh` (`disable_upstream_workflows`
+in `ionos-lib.sh`). After the default branch is switched GitHub lists upstream's workflow files lazily, and a
+pull request opened in that window started ten of them. A dry run only prints `would: disable ...`; a 4xx on
+one workflow is a warning; another failure stops the run before anything is created. This needs `actions:
+write`: the sync token has it, and the workflow's `permissions:` grants it for the default-token fallback.
+
 **Two tokens.** Public upstream data (`nextcloud/*`, `nextcloud-releases/*`: tags, the app list, tag objects)
 is read with `READ_TOKEN`, which the workflow sets to the default `GITHUB_TOKEN` (the script falls back to
 `GH_TOKEN` when it is unset, for local use). The `nextcloud` organization forbids fine-grained personal access
