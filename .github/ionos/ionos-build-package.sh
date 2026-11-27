@@ -11,6 +11,10 @@
 #   BUILD_NUMBER   the run number
 #   LINE           the stable line, for example 33
 #   SERVER_COMMIT, FLAVORS_COMMIT   the commits built (full shas)
+#   KIND           dev (default) or release. A release build also needs SNAPSHOT_BRANCH, RELEASE_NR and RELEASE_SCOPE (all read by
+#                  the plan job from the snapshot tag's annotation) and SNAPSHOT_BASE (the base release of that tag, which
+#                  must be the base release of the built tree); they become --snapshot-branch, --release-number and --scope
+#                  of `ncw build`, so they end up in version.json. A dev build passes none of them.
 #   NCW            the flavors tool command, default "node IONOS/tools/src/cli.ts"
 set -euo pipefail
 
@@ -33,6 +37,21 @@ OUT="$WORK/out"
 [[ $BUILD_NUMBER =~ ^[1-9][0-9]*$ ]] || die "BUILD_NUMBER '$BUILD_NUMBER' is not a positive integer"
 [[ $LINE =~ ^[0-9]+$ ]] || die "LINE '$LINE' is not a number"
 [[ $SERVER_COMMIT =~ ^[0-9a-f]{7,64}$ && $FLAVORS_COMMIT =~ ^[0-9a-f]{7,64}$ ]] || die "SERVER_COMMIT and FLAVORS_COMMIT must be hex commit shas"
+KIND=${KIND:-dev}
+SNAPSHOT_ARGS=()
+case "$KIND" in
+  dev) ;;
+  release)
+    [[ ${SNAPSHOT_BRANCH:-} =~ $SNAPSHOT_BRANCH_RE ]] || die "a release build needs SNAPSHOT_BRANCH, a snapshot branch rc/ncw-v<nn>-<n>"
+    [[ ${RELEASE_NR:-} =~ ^[1-9][0-9]*$ ]] || die "a release build needs RELEASE_NR, a positive integer"
+    valid_scope "${RELEASE_SCOPE:-}" || die "a release build needs RELEASE_SCOPE, the scope text of the snapshot tag"
+    [[ ${SNAPSHOT_BASE:-} =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "a release build needs SNAPSHOT_BASE, the base release of the snapshot tag"
+    [ "$(cat "$WORK/base-release" 2>/dev/null)" = "$SNAPSHOT_BASE" ] \
+      || die "the built tree has base release '$(cat "$WORK/base-release" 2>/dev/null)' but the snapshot tag says $SNAPSHOT_BASE: nothing is built"
+    SNAPSHOT_ARGS=(--snapshot-branch "$SNAPSHOT_BRANCH" --release-number "$RELEASE_NR" "--scope=$RELEASE_SCOPE")
+    ;;
+  *) die "KIND '$KIND' is not dev or release" ;;
+esac
 [ -f "$TREE/version.php" ] || die "no assembly tree in $TREE; run ionos-build-assemble.sh first"
 
 # pins_file <flavor>: {"<app>": {"commit": <sha>, "describe": <git describe>}} of the flavor's built submodule apps
@@ -63,9 +82,9 @@ build_flavor() {
   local flavor="$1" pins zip
   pins=$(pins_file "$flavor") || return 1
   log "building flavor $flavor (build $BUILD_NUMBER)"
-  zip=$("${NCW_CMD[@]}" build --flavors "$FLAVORS_DIR" --flavor "$flavor" --tree "$TREE" --line "$LINE" --kind dev \
+  zip=$("${NCW_CMD[@]}" build --flavors "$FLAVORS_DIR" --flavor "$flavor" --tree "$TREE" --line "$LINE" --kind "$KIND" \
     --build-number "$BUILD_NUMBER" --out "$OUT" --server-commit "$SERVER_COMMIT" --flavors-commit "$FLAVORS_COMMIT" \
-    --app-pins "$pins") || { warn "the build of flavor $flavor failed"; return 1; }
+    --app-pins "$pins" "${SNAPSHOT_ARGS[@]}") || { warn "the build of flavor $flavor failed"; return 1; }
   [ -f "$zip" ] || { warn "the build of flavor $flavor printed '$zip', which is not a file"; return 1; }
   log "validating $(basename "$zip")"
   if ! "${NCW_CMD[@]}" validate --flavors "$FLAVORS_DIR" --flavor "$flavor" --artifact "$zip"; then

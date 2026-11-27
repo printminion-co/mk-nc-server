@@ -43,15 +43,57 @@ case "$1" in
     ep=""; for a in "${args[@]}"; do case "$a" in repos/*) ep="$a" ;; esac; done
     case "$ep" in
       */releases/tags/*) t="${ep##*/releases/tags/}"; jq -r --arg t "$t" '.[]|select(.tag_name==$t)|.body' "$S/releases.json" ;;
+      */git/matching-refs/tags/*) [ "${STUB_FAIL:-}" = tags ] && { echo "gh: boom (HTTP 500)" >&2; exit 1; }
+        p="refs/tags/${ep#*/git/matching-refs/tags/}"; jq --arg p "$p" '[.[]|select(.ref|startswith($p))]' "$S/tags.json" 2>/dev/null || echo '[]' ;;
+      */git/tags/*) cat "$S/tagobjs/${ep##*/git/tags/}.json" 2>/dev/null || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; } ;;
       */releases) [ "${STUB_FAIL:-}" = list ] && { echo "gh: boom (HTTP 500)" >&2; exit 1; }; cat "$S/releases.json" ;;
       *) echo "stub gh: unexpected api $ep" >&2; exit 2 ;;
     esac ;;
   release)
     sub="$2"; shift 2
     case "$sub" in
-      view) exists "$1" ;;
+      view)
+        tag="$1"; shift; json=""; jqx=""
+        while [ $# -gt 0 ]; do case "$1" in --json) json="$2"; shift 2 ;; --jq) jqx="$2"; shift 2 ;; -R) shift 2 ;; *) shift ;; esac; done
+        exists "$tag" || exit 1
+        if [ "$json" = assets ]; then
+          out="$(jq -c --arg t "$tag" '.[]|select(.tag_name==$t)|{assets:[.assets[]|{name:.}]}' "$S/releases.json")"
+          if [ -n "$jqx" ]; then jq -r "$jqx" <<<"$out"; else echo "$out"; fi
+        fi ;;
+      upload)
+        tag="$1"; shift; assets=()
+        while [ $# -gt 0 ]; do case "$1" in -R) shift 2 ;; --clobber) echo "clobber" >> "$S/clobber.log"; shift ;; --*) shift ;; *) assets+=("$1"); shift ;; esac; done
+        exists "$tag" || { echo "gh: release not found" >&2; exit 1; }
+        [ "${STUB_FAIL:-}" = upload ] && { echo "gh: upload failed (HTTP 500)" >&2; exit 1; }
+        for a in "${assets[@]}"; do
+          n="$(basename "$a")"
+          jq -e --arg t "$tag" --arg n "$n" 'any(.[]|select(.tag_name==$t)|.assets[]; .==$n)' "$S/releases.json" >/dev/null \
+            && { echo "gh: asset $n already exists (HTTP 422)" >&2; exit 1; }
+        done
+        mkdir -p "$S/assets/$tag"
+        for a in "${assets[@]}"; do
+          cp "$a" "$S/assets/$tag/"
+          save "map(if .tag_name == $(jq -Rn --arg t "$tag" '$t') then .assets += [$(jq -Rn --arg t "$(basename "$a")" '$t')] else . end)"
+        done ;;
+      edit)
+        tag="$1"; shift; notes=""; title=""
+        while [ $# -gt 0 ]; do case "$1" in --notes-file) notes="$2"; shift 2 ;; --title) title="$2"; shift 2 ;; -R) shift 2 ;; *) shift ;; esac; done
+        exists "$tag" || { echo "gh: release not found" >&2; exit 1; }
+        [ "${STUB_FAIL:-}" = edit ] && { echo "gh: edit failed (HTTP 500)" >&2; exit 1; }
+        [ -z "$notes" ] || save "map(if .tag_name == $(jq -Rn --arg t "$tag" '$t') then .body = $(jq -Rn --arg t "$(cat "$notes")" '$t') else . end)"
+        [ -z "$title" ] || save "map(if .tag_name == $(jq -Rn --arg t "$tag" '$t') then .name = $(jq -Rn --arg t "$title" '$t') else . end)" ;;
+      download)
+        tag="$1"; shift; pat=""; dir="."
+        while [ $# -gt 0 ]; do case "$1" in -p|--pattern) pat="$2"; shift 2 ;; -D|--dir) dir="$2"; shift 2 ;; -R) shift 2 ;; *) shift ;; esac; done
+        exists "$tag" || { echo "gh: release not found" >&2; exit 1; }
+        mkdir -p "$dir"
+        for f in "$S/assets/$tag/"*; do
+          [ -e "$f" ] || continue
+          # shellcheck disable=SC2254
+          case "$(basename "$f")" in $pat) cp "$f" "$dir/" ;; esac
+        done ;;
       create)
-        tag="$1"; shift; title=""; notes=""; target=""; pre=false; assets=()
+        tag="$1"; shift; title=""; notes=""; target=""; pre=false; latest=unset; verify=false; assets=(); files=()
         while [ $# -gt 0 ]; do
           case "$1" in
             --title) title="$2"; shift 2 ;;
@@ -59,15 +101,21 @@ case "$1" in
             --target) target="$2"; shift 2 ;;
             -R) shift 2 ;;
             --prerelease) pre=true; shift ;;
+            --latest=*) latest="${1#--latest=}"; shift ;;
+            --verify-tag) verify=true; shift ;;
             --*) shift ;;
-            *) assets+=("$(basename "$1")"); shift ;;
+            *) assets+=("$(basename "$1")"); files+=("$1"); shift ;;
           esac
         done
         [ "${STUB_FAIL:-}" = release ] && { echo "gh: release failed (HTTP 500)" >&2; exit 1; }
         exists "$tag" && { echo "gh: tag exists (HTTP 422)" >&2; exit 1; }
+        if [ "$verify" = true ]; then
+          jq -e --arg r "refs/tags/$tag" 'any(.[]; .ref == $r)' "$S/tags.json" >/dev/null 2>&1 || { echo "gh: tag $tag does not exist (--verify-tag)" >&2; exit 1; }
+        fi
         body="$(cat "$notes")"
         n="$(jq 'length' "$S/releases.json")"
-        save ". + [{\"tag_name\":$(jq -Rn --arg t "$tag" '$t'),\"name\":$(jq -Rn --arg t "$title" '$t'),\"prerelease\":$pre,\"draft\":false,\"target_commitish\":$(jq -Rn --arg t "$target" '$t'),\"body\":$(jq -Rn --arg t "$body" '$t'),\"assets\":$(printf '%s\n' "${assets[@]}" | jq -R . | jq -sc .),\"id\":$((n + 1))}]" ;;
+        mkdir -p "$S/assets/$tag"; for f in "${files[@]}"; do cp "$f" "$S/assets/$tag/"; done
+        save ". + [{\"tag_name\":$(jq -Rn --arg t "$tag" '$t'),\"name\":$(jq -Rn --arg t "$title" '$t'),\"prerelease\":$pre,\"latest\":\"$latest\",\"verify_tag\":$verify,\"draft\":false,\"target_commitish\":$(jq -Rn --arg t "$target" '$t'),\"body\":$(jq -Rn --arg t "$body" '$t'),\"assets\":$(printf '%s\n' "${assets[@]}" | jq -R . | jq -sc .),\"id\":$((n + 1))}]" ;;
       delete)
         tag="$1"; exists "$tag" || { echo "gh: not found" >&2; exit 1; }
         save "map(select(.tag_name != $(jq -Rn --arg t "$tag" '$t')))"
@@ -183,9 +231,11 @@ sc_plan() {
 
   newworld p6; repo p6
   run_in p6 ionos-build-plan.sh EVENT_NAME=workflow_dispatch KIND=release REF_NAME=ionos-dev-v33
-  check "release kind fails early" test "$(status p6)" != 0
-  check "release kind says release builds arrive with the snapshot ticket" logged p6 'snapshot ticket'
+  check "release kind on the dev branch fails early" test "$(status p6)" != 0
+  check "and says release builds run only from a snapshot branch" logged p6 'rc/ncw-v<nn>-<n>'
   check "release kind sets no build output" test -z "$(output p6 build)"
+  run_in p6 ionos-build-plan.sh EVENT_NAME=workflow_dispatch KIND=dev REF_NAME=rc/ncw-v33-1
+  check "a dev build from a snapshot branch is refused" test "$(status p6)" != 0
   run_in p6 ionos-build-plan.sh EVENT_NAME=workflow_dispatch KIND=bogus REF_NAME=ionos-dev-v33
   check "an unknown kind fails" test "$(status p6)" != 0
   run_in p6 ionos-build-plan.sh EVENT_NAME=workflow_dispatch KIND=dev REF_NAME=main
@@ -239,13 +289,14 @@ sc_retention() {
 
 # ---------------------------------------------------------------- publish
 # pubworld <name>: a work directory with two flavors' archives and checksums
-pubworld() {
+pubworld() { # pubworld <name> [build number, default 42]
+  local bn="${2:-42}"
   newworld "$1"
   local w="$ROOT/$1/work"; mkdir -p "$w/out"
   local f
   for f in flavor1 flavor2; do
-    echo "zip $f" > "$w/out/ncw-$f-v33.0.9.42.zip"
-    (cd "$w/out" && sha256sum "ncw-$f-v33.0.9.42.zip" > "ncw-$f-v33.0.9.42.zip.sha256")
+    echo "zip $f $bn" > "$w/out/ncw-$f-v33.0.9.$bn.zip"
+    (cd "$w/out" && sha256sum "ncw-$f-v33.0.9.$bn.zip" > "ncw-$f-v33.0.9.$bn.zip.sha256")
   done
   printf 'flavor1\nflavor2\n' > "$w/flavors.txt"
   echo 33.0.9 > "$w/base-release"; echo all > "$w/scope"
@@ -324,6 +375,302 @@ sc_publish() {
   check "dry run creates nothing" test "$(n_calls u7 'release create')" = 0 -a "$(status u7)" = 0
 }
 
+# ---------------------------------------------------------------- release builds: plan
+# msg <rehearsal> <line> <base> <nr> <source branch> <source commit> <scope>: a snapshot tag annotation
+msg() { ( . "$HERE/ionos-lib.sh"; snapshot_tag_message "$@" ); }
+# addtag <world> <tag name> <annotated true|false> <commit> <annotation>: a tag of the stubbed fork
+addtag() {
+  local w="$ROOT/$1/state" obj="obj-$2"
+  [ -f "$w/tags.json" ] || echo '[]' > "$w/tags.json"
+  mkdir -p "$w/tagobjs"
+  if [ "$3" = true ]; then
+    jq --arg r "refs/tags/$2" --arg o "$obj" '. + [{ref:$r,object:{type:"tag",sha:$o}}]' "$w/tags.json" > "$w/t.tmp"
+    jq -n --arg c "$4" --arg m "$5" '{object:{type:"commit",sha:$c},message:$m}' > "$w/tagobjs/$obj.json"
+  else
+    jq --arg r "refs/tags/$2" --arg c "$4" '. + [{ref:$r,object:{type:"commit",sha:$c}}]' "$w/tags.json" > "$w/t.tmp"
+  fi
+  mv "$w/t.tmp" "$w/tags.json"
+}
+RPLAN=(EVENT_NAME=workflow_dispatch KIND=release REF_TYPE=branch)
+sc_release_plan() {
+  newworld q; repo q; local h; h=$(head_of q)
+  addtag q ncw-v33.0.9-1 true "$h" "$(msg false 33 33.0.9 1 ionos-dev-v33 "$h" 'First release: flavor1 = x')"
+  run_in q ionos-build-plan.sh "${RPLAN[@]}" REF_NAME=rc/ncw-v33-1
+  check "a release build of a snapshot branch with its tag is planned" test "$(status q)" = 0 -a "$(output q build)" = true
+  check "kind, tag and base release are reported" test "$(output q kind)" = release -a "$(output q tag)" = ncw-v33.0.9-1 -a "$(output q base_release)" = 33.0.9
+  check "line, release number, snapshot branch, rehearsal" test "$(output q line)" = 33 -a "$(output q release_nr)" = 1 -a "$(output q snapshot_branch)" = rc/ncw-v33-1 -a "$(output q rehearsal)" = false
+  check "the scope is read from the tag annotation (with = and spaces intact)" test "$(output q scope)" = 'First release: flavor1 = x'
+  check "source branch and commit come from the annotation too" test "$(output q source_branch)" = ionos-dev-v33 -a "$(output q source_commit)" = "$h"
+  check "the commits built are reported" test "$(output q server_commit)" = "$h" -a "$(output q flavors_commit)" = "$FLAVORS_SHA"
+  run_in q ionos-build-plan.sh "${RPLAN[@]}" REF_NAME=rc/ncw-v33-1 FORCE=false EVENT_NAME=schedule
+  check "a release build is never started by a schedule" test "$(status q)" != 0
+  run_in q ionos-build-plan.sh "${RPLAN[@]}" REF_NAME=rc/ncw-v33-1 FLAVORS=flavor1
+  check "a release build builds every flavor: the flavors input is refused" test "$(status q)" != 0
+  check "and says why" logged q 'flavors'
+  run_in q ionos-build-plan.sh "${RPLAN[@]}" REF_NAME=rc/ncw-v33-1 FORCE=true
+  check "force makes no sense for a release build and is refused" test "$(status q)" != 0
+  run_in q ionos-build-plan.sh "${RPLAN[@]}" REF_NAME=rc/ncw-v33-1 REF_TYPE=tag
+  check "a tag ref named like a snapshot branch is refused" test "$(status q)" != 0
+  local bad
+  for bad in main ionos-dev-v33 rc/ncw-v33-01 rc/ncw-v33-0 rc/ncw-v33-x rc/ncw-v33 rc/ncw-v33-1/x candidate/ionos-dev-v33/v33.0.10 rehearsal/ncw-v33-1x 'rc/ncw-v33-1;id' foo/ncw-v33-1; do
+    run_in q ionos-build-plan.sh "${RPLAN[@]}" "REF_NAME=$bad"
+    check "ref '$bad' is refused for a release build" test "$(status q)" != 0 -a -z "$(output q build)"
+  done
+
+  newworld q2; repo q2; h=$(head_of q2)
+  run_in q2 ionos-build-plan.sh "${RPLAN[@]}" REF_NAME=rc/ncw-v33-1
+  check "a snapshot branch without any tag is refused" test "$(status q2)" != 0
+  check "the message says the snapshot workflow makes the tag" logged q2 'snapshot workflow'
+  addtag q2 ncw-v33.0.9-1 false "$h" ""
+  run_in q2 ionos-build-plan.sh "${RPLAN[@]}" REF_NAME=rc/ncw-v33-1
+  check "a lightweight tag is refused (it cannot carry the scope)" test "$(status q2)" != 0 -a -z "$(output q2 build)"
+  check "and the message says lightweight" logged q2 'lightweight'
+
+  newworld q3; repo q3; h=$(head_of q3)
+  addtag q3 ncw-v33.0.9-1 true 9999999999999999999999999999999999999999 "$(msg false 33 33.0.9 1 ionos-dev-v33 "$h" 's')"
+  run_in q3 ionos-build-plan.sh "${RPLAN[@]}" REF_NAME=rc/ncw-v33-1
+  check "a tag that points at another commit than the one built is refused" test "$(status q3)" != 0 -a -z "$(output q3 build)"
+  check "and the message names both commits" logged q3 '9999999999999999999999999999999999999999'
+
+  newworld q4; repo q4; h=$(head_of q4)
+  addtag q4 ncw-v33.0.9-1 true "$h" "$(msg false 33 33.0.9 2 ionos-dev-v33 "$h" 's')"
+  run_in q4 ionos-build-plan.sh "${RPLAN[@]}" REF_NAME=rc/ncw-v33-1
+  check "an annotation with another release number than the branch is refused" test "$(status q4)" != 0
+  newworld q5; repo q5; h=$(head_of q5)
+  addtag q5 ncw-v33.0.9-1 true "$h" "$(msg true 33 33.0.9 1 ionos-dev-v33 "$h" 's')"
+  run_in q5 ionos-build-plan.sh "${RPLAN[@]}" REF_NAME=rc/ncw-v33-1
+  check "an annotation of a rehearsal on a real branch is refused" test "$(status q5)" != 0
+  newworld q6; repo q6; h=$(head_of q6)
+  addtag q6 ncw-v33.0.9-1 true "$h" "$(msg false 33 33.0.10 1 ionos-dev-v33 "$h" 's')"
+  run_in q6 ionos-build-plan.sh "${RPLAN[@]}" REF_NAME=rc/ncw-v33-1
+  check "an annotation whose base release does not fit the tag name is refused" test "$(status q6)" != 0
+  newworld q7; repo q7; h=$(head_of q7)
+  addtag q7 ncw-v33.0.9-1 true "$h" "no keys at all"
+  run_in q7 ionos-build-plan.sh "${RPLAN[@]}" REF_NAME=rc/ncw-v33-1
+  check "an annotation without the snapshot facts is refused" test "$(status q7)" != 0
+  newworld q8; repo q8; h=$(head_of q8)
+  addtag q8 ncw-v33.0.9-1 true "$h" "$(msg false 33 33.0.9 1 ionos-dev-v33 "$h" 's')"
+  addtag q8 ncw-v33.0.8-1 true "$h" "$(msg false 33 33.0.8 1 ionos-dev-v33 "$h" 's')"
+  run_in q8 ionos-build-plan.sh "${RPLAN[@]}" REF_NAME=rc/ncw-v33-1
+  check "two tags with the same release number on the line are refused" test "$(status q8)" != 0
+  newworld q9; repo q9; h=$(head_of q9)
+  addtag q9 ncw-v33.0.9-10 true "$h" "$(msg false 33 33.0.9 10 ionos-dev-v33 "$h" 'ten')"
+  run_in q9 ionos-build-plan.sh "${RPLAN[@]}" REF_NAME=rc/ncw-v33-1
+  check "the tag of release 10 is not the tag of release 1" test "$(status q9)" != 0
+  addtag q9 rehearsal-v33.0.9-1 true "$h" "$(msg true 33 33.0.9 1 ionos-dev-v33 "$h" 'rehearse')"
+  run_in q9 ionos-build-plan.sh "${RPLAN[@]}" REF_NAME=rc/ncw-v33-1
+  check "a rehearsal tag is never the tag of a real snapshot branch" test "$(status q9)" != 0
+  run_in q9 ionos-build-plan.sh "${RPLAN[@]}" REF_NAME=rehearsal/ncw-v33-1
+  check "a rehearsal branch finds its rehearsal tag" test "$(status q9)" = 0 -a "$(output q9 rehearsal)" = true -a "$(output q9 tag)" = rehearsal-v33.0.9-1
+  check "the rehearsal flag comes from the ref, the scope from the annotation" test "$(output q9 snapshot_branch)" = rehearsal/ncw-v33-1 -a "$(output q9 scope)" = rehearse
+  run_in q9 ionos-build-plan.sh "${RPLAN[@]}" REF_NAME=rehearsal/ncw-v33-1 STUB_FAIL=tags
+  check "a failing tag listing fails the run" test "$(status q9)" != 0
+
+  # dev behavior is unchanged
+  newworld q10; repo q10
+  run_in q10 ionos-build-plan.sh EVENT_NAME=workflow_dispatch KIND=dev REF_NAME=ionos-dev-v33
+  check "a dev run still reports kind dev and no snapshot facts" test "$(output q10 kind)" = dev -a -z "$(output q10 tag)" -a -z "$(output q10 scope)"
+  run_in q10 ionos-build-plan.sh EVENT_NAME=schedule KIND=dev REF_NAME=ionos-dev-v33
+  check "a scheduled dev run still reports kind dev" test "$(output q10 kind)" = dev
+}
+
+# ---------------------------------------------------------------- release builds: package
+sc_release_package() {
+  [ -d "$ROOT/src/a" ] || mkapp a
+  fork z1 a
+  run_build z1 ionos-build-select.sh
+  run_build z1 ionos-build-apps.sh
+  run_build z1 ionos-build-assemble.sh
+  local sha=0123456789abcdef0123456789abcdef01234567 fsha=fedcba9876543210fedcba9876543210fedcba98
+  local rel=(KIND=release SNAPSHOT_BRANCH=rc/ncw-v33-1 RELEASE_NR=1 "RELEASE_SCOPE=First release: \$(x) & y" SNAPSHOT_BASE=33.0.9)
+  run_build z1 ionos-build-package.sh BUILD_NUMBER=58 LINE=33 SERVER_COMMIT=$sha FLAVORS_COMMIT=$fsha "${rel[@]}"
+  check "a release package succeeds" test "$(status z1)" = 0
+  check "build gets kind release" grep -q 'ncw build flavor1 kind=release bn=58 ' "$ROOT/z1/ncw.log"
+  check "build gets snapshot branch, release number and the scope text intact" grep -qF 'sb=rc/ncw-v33-1 rn=1 scope=First release: $(x) & y' "$ROOT/z1/ncw.log"
+  check "every flavor gets them" test "$(grep -c 'kind=release bn=58 .*sb=rc/ncw-v33-1 rn=1' "$ROOT/z1/ncw.log" | head -1)" = 2
+  check "the archives carry the release build number" test -f "$ROOT/z1/work/out/ncw-flavor1-v33.0.9.58.zip.sha256"
+  check "validate runs for a release build too" test "$(grep -c '^ncw validate' "$ROOT/z1/ncw.log")" = 2
+  check "no cache keys for a release build either (cache is a later ticket)" test "$(grep -c 'cache-keys' "$ROOT/z1/ncw.log")" = 0
+  check "the run is marked validated" test "$(cat "$ROOT/z1/work/validated")" = "$(cat "$ROOT/z1/work/flavors.txt")"
+  run_build z1 ionos-build-package.sh BUILD_NUMBER=58 LINE=33 "SERVER_COMMIT=$sha" "FLAVORS_COMMIT=$fsha" KIND=release SNAPSHOT_BRANCH=rc/ncw-v33-1 RELEASE_NR=1 "RELEASE_SCOPE=--kind dev" SNAPSHOT_BASE=33.0.9
+  check "a scope that looks like an option is passed as the value of --scope, not parsed as an option" test "$(status z1)" = 0 -a "$(grep -c 'kind=release bn=58 .* scope=--kind dev$' "$ROOT/z1/ncw.log")" -ge 1
+  local base_args=(BUILD_NUMBER=59 LINE=33 "SERVER_COMMIT=$sha" "FLAVORS_COMMIT=$fsha")
+  run_build z1 ionos-build-package.sh "${base_args[@]}" KIND=release RELEASE_NR=1 RELEASE_SCOPE=s SNAPSHOT_BASE=33.0.9
+  check "a release build without the snapshot branch is refused" test "$(status z1)" != 0
+  run_build z1 ionos-build-package.sh "${base_args[@]}" KIND=release SNAPSHOT_BRANCH=rc/ncw-v33-1 RELEASE_SCOPE=s SNAPSHOT_BASE=33.0.9
+  check "a release build without the release number is refused" test "$(status z1)" != 0
+  run_build z1 ionos-build-package.sh "${base_args[@]}" KIND=release SNAPSHOT_BRANCH=rc/ncw-v33-1 RELEASE_NR=1 SNAPSHOT_BASE=33.0.9
+  check "a release build without the scope is refused" test "$(status z1)" != 0
+  run_build z1 ionos-build-package.sh "${base_args[@]}" KIND=release SNAPSHOT_BRANCH=rc/ncw-v33-1 RELEASE_NR=1 RELEASE_SCOPE=s SNAPSHOT_BASE=33.0.10
+  check "a base release that differs from the snapshot tag's is refused before anything is built" test "$(status z1)" != 0 -a ! -e "$ROOT/z1/work/out/ncw-flavor1-v33.0.9.59.zip"
+  run_build z1 ionos-build-package.sh "${base_args[@]}" KIND=release SNAPSHOT_BRANCH=rc/ncw-v33-1 RELEASE_NR=1 RELEASE_SCOPE=s
+  check "a release build must know the snapshot tag's base release" test "$(status z1)" != 0
+  run_build z1 ionos-build-package.sh "${base_args[@]}" KIND=release SNAPSHOT_BRANCH=main RELEASE_NR=1 RELEASE_SCOPE=s SNAPSHOT_BASE=33.0.9
+  check "a snapshot branch that is not one is refused" test "$(status z1)" != 0
+  run_build z1 ionos-build-package.sh "${base_args[@]}" KIND=bogus
+  check "an unknown kind is refused" test "$(status z1)" != 0
+  : > "$ROOT/z1/ncw.log"
+  run_build z1 ionos-build-package.sh "${base_args[@]}" SNAPSHOT_BRANCH=rc/ncw-v33-1 RELEASE_NR=1 RELEASE_SCOPE=leak
+  check "a dev build passes no snapshot facts even if some are set" test "$(status z1)" = 0 -a "$(grep -c 'kind=dev bn=59 .* sb= rn= scope=$' "$ROOT/z1/ncw.log")" = 2
+}
+
+# ---------------------------------------------------------------- release builds: publish
+REL_SCOPE='First release: flavor1'
+# relpub <extra env...>: the environment of a release publish for the snapshot ncw-v33.0.9-1
+relenv() { # relenv <build number> [VAR=value ...]
+  local bn="$1"; shift
+  RELENV=(BUILD_NUMBER="$bn" SERVER_COMMIT=aaaaaaa FLAVORS_COMMIT=bbbbbbb RUN_URL="https://example.invalid/run/$bn" KIND=release
+    SNAPSHOT_TAG=ncw-v33.0.9-1 SNAPSHOT_BRANCH=rc/ncw-v33-1 RELEASE_NR=1 "RELEASE_SCOPE=$REL_SCOPE" SNAPSHOT_BASE=33.0.9 REHEARSAL=false
+    SOURCE_BRANCH=ionos-dev-v33 SOURCE_COMMIT=cccccccccccccccccccccccccccccccccccccccc "$@")
+}
+relpub() { # relpub <world> <build number> [VAR=value ...]  (the world's work dir holds the archives of that build)
+  local w="$1" bn="$2"; shift 2
+  relenv "$bn" "$@"
+  run_in "$w" ionos-build-publish.sh WORK="$ROOT/$w/work" "${RELENV[@]}"
+}
+# newbuild <world> <build number>: archives of another build for the same world (a rebuild)
+newbuild() {
+  local w="$ROOT/$1/work" bn="$2" f
+  rm -rf "$w/out"; mkdir -p "$w/out"
+  for f in flavor1 flavor2; do
+    echo "zip $f $bn" > "$w/out/ncw-$f-v33.0.9.$bn.zip"
+    (cd "$w/out" && sha256sum "ncw-$f-v33.0.9.$bn.zip" > "ncw-$f-v33.0.9.$bn.zip.sha256")
+  done
+  echo bundle > "$w/out/ncw-build-$bn.attestation.jsonl"
+}
+reljson() { jq -r "$2" "$ROOT/$1/state/releases.json"; }
+sc_release_publish() {
+  pubworld v1 57; echo bundle > "$ROOT/v1/work/out/ncw-build-57.attestation.jsonl"
+  addtag v1 ncw-v33.0.9-1 true cccccccccccccccccccccccccccccccccccccccc "x"
+  relpub v1 57
+  check "the release publish succeeds" test "$(status v1)" = 0
+  check "one release on the existing snapshot tag" test "$(tags v1)" = ncw-v33.0.9-1
+  check "the tag is only verified, never created: --verify-tag, no --target" test "$(reljson v1 '.[0].verify_tag')" = true -a "$(reljson v1 '.[0].target_commitish')" = ""
+  check "it is a real release, not a pre-release" test "$(reljson v1 '.[0].prerelease')" = false
+  check "it is not marked as the latest release" test "$(reljson v1 '.[0].latest')" = false
+  check "title is the tag name" test "$(reljson v1 '.[0].name')" = ncw-v33.0.9-1
+  check "assets: every zip, its checksum and the attestation bundle" test "$(reljson v1 '.[0].assets | sort | join(" ")')" = "ncw-build-57.attestation.jsonl ncw-flavor1-v33.0.9.57.zip ncw-flavor1-v33.0.9.57.zip.sha256 ncw-flavor2-v33.0.9.57.zip ncw-flavor2-v33.0.9.57.zip.sha256"
+  local body; body=$(reljson v1 '.[0].body')
+  local sha1 sha2; sha1=$(cut -d' ' -f1 "$ROOT/v1/work/out/ncw-flavor1-v33.0.9.57.zip.sha256"); sha2=$(cut -d' ' -f1 "$ROOT/v1/work/out/ncw-flavor2-v33.0.9.57.zip.sha256")
+  check "body shows the scope" grep -qF "$REL_SCOPE" <<<"$body"
+  check "body shows the base release, release number, snapshot branch and tag" bash -c "grep -q 'v33.0.9' <<<'$body' && grep -q 'rc/ncw-v33-1' <<<'$body' && grep -q 'ncw-v33.0.9-1' <<<'$body' && grep -Eq 'Release number.*1' <<<'$body'"
+  check "body has a table row per archive with flavor, file, build number and sha256" bash -c "grep -F 'flavor1' <<<'$body' | grep -F 'ncw-flavor1-v33.0.9.57.zip' | grep -F '57' | grep -qF '$sha1' && grep -F 'flavor2' <<<'$body' | grep -F 'ncw-flavor2-v33.0.9.57.zip' | grep -qF '$sha2'"
+  check "body gives the verify hints with the repository" bash -c "grep -q 'gh attestation verify' <<<'$body' && grep -q 'acme/server' <<<'$body' && grep -q 'sha256sum' <<<'$body'"
+  check "body has the machine-readable lines" bash -c "grep -qx 'release_nr: 1' <<<'$body' && grep -qx 'base_release: v33.0.9' <<<'$body' && grep -qx 'snapshot_branch: rc/ncw-v33-1' <<<'$body' && grep -qx 'snapshot_tag: ncw-v33.0.9-1' <<<'$body' && grep -qx 'latest_build_number: 57' <<<'$body' && grep -qx 'server_commit: aaaaaaa' <<<'$body'"
+  check "body links the run" grep -q 'https://example.invalid/run/57' <<<"$body"
+  check "body does not claim to be a rehearsal" bash -c "! grep -qi 'rehearsal' <<<'$body'"
+  check "no gh call deletes or clobbers anything" bash -c "! grep -Eq 'delete|--clobber' '$ROOT/v1/state/calls.log'"
+
+  # a rebuild: a new run on the same snapshot attaches new assets to the SAME release and extends the table
+  newbuild v1 63
+  relpub v1 63
+  check "the rebuild succeeds" test "$(status v1)" = 0
+  check "there is still exactly one release" test "$(tags v1)" = ncw-v33.0.9-1
+  check "new assets with the new build number are attached" test "$(reljson v1 '.[0].assets | map(select(test("\\.63\\.")) ) | length')" = 4
+  check "the earlier assets are all still there" test "$(reljson v1 '.[0].assets | map(select(test("\\.57\\."))) | length')" = 4 -a "$(reljson v1 '.[0].assets | index("ncw-build-57.attestation.jsonl") != null')" = true
+  check "the new attestation bundle is attached" test "$(reljson v1 '.[0].assets | index("ncw-build-63.attestation.jsonl") != null')" = true
+  check "release was created once, uploaded once, edited once" test "$(n_calls v1 'release create')" = 1 -a "$(n_calls v1 'release upload')" = 1 -a "$(n_calls v1 'release edit')" = 1
+  check "the upload never clobbers" test ! -e "$ROOT/v1/state/clobber.log"
+  body=$(reljson v1 '.[0].body')
+  check "the table now lists the old and the new archives" bash -c "grep -c 'ncw-flavor[12]-v33.0.9.\\(57\\|63\\).zip' <<<'$body' | grep -qx '[4-9]'"
+  check "old rows keep their sha256" bash -c "grep -F 'ncw-flavor1-v33.0.9.57.zip' <<<'$body' | grep -qF '$sha1'"
+  check "new rows have the new sha256" bash -c "grep -F 'ncw-flavor1-v33.0.9.63.zip' <<<'$body' | grep -qF '$(cut -d' ' -f1 "$ROOT/v1/work/out/ncw-flavor1-v33.0.9.63.zip.sha256")'"
+  check "the newest build comes first" bash -c "[ \$(grep -n 'v33.0.9.63.zip' <<<'$body' | head -1 | cut -d: -f1) -lt \$(grep -n 'v33.0.9.57.zip' <<<'$body' | head -1 | cut -d: -f1) ]"
+  check "latest_build_number follows the rebuild" bash -c "grep -qx 'latest_build_number: 63' <<<'$body'"
+  check "the scope stays in the body" grep -qF "$REL_SCOPE" <<<"$body"
+  check "the title is unchanged" test "$(reljson v1 '.[0].name')" = ncw-v33.0.9-1
+  check "still not a pre-release" test "$(reljson v1 '.[0].prerelease')" = false
+
+  # build numbers must increase
+  local assets_before; assets_before=$(reljson v1 '.[0].assets | sort | join(" ")')
+  for bn in 63 60 57 1; do
+    newbuild v1 "$bn"; relpub v1 "$bn"
+    check "build number $bn is not larger than the attached 63: refused" test "$(status v1)" != 0
+  done
+  check "the refusal says which build number is the highest" logged v1 '63'
+  check "refused runs changed nothing" test "$(reljson v1 '.[0].assets | sort | join(" ")')" = "$assets_before" -a "$(n_calls v1 'release upload')" = 1
+  newbuild v1 64; relpub v1 64
+  check "a larger number is accepted after the refusals" test "$(status v1)" = 0
+
+  # an attestation bundle of a higher build counts too
+  pubworld v2 70; addtag v2 ncw-v33.0.9-1 true cccccccccccccccccccccccccccccccccccccccc "x"
+  addrel v2 ncw-v33.0.9-1 false
+  jq '.[0].assets = ["ncw-build-80.attestation.jsonl"]' "$ROOT/v2/state/releases.json" > "$ROOT/v2/state/r.tmp" && mv "$ROOT/v2/state/r.tmp" "$ROOT/v2/state/releases.json"
+  relpub v2 70
+  check "a bundle of a higher build counts for the strictly-larger rule" test "$(status v2)" != 0 -a "$(n_calls v2 'release upload')" = 0
+
+  # failures leave the release as it is
+  pubworld v3 5; addtag v3 ncw-v33.0.9-1 true cccccccccccccccccccccccccccccccccccccccc "x"
+  relpub v3 5
+  newbuild v3 6
+  relpub v3 6 STUB_FAIL=upload
+  check "a failing upload fails the run" test "$(status v3)" != 0
+  check "and the body is not edited (it still lists only build 5)" bash -c "! grep -q 'v33.0.9.6.zip' <<<\"\$(jq -r '.[0].body' '$ROOT/v3/state/releases.json')\""
+  relpub v3 6 STUB_FAIL=edit
+  check "a failing body update fails the run" test "$(status v3)" != 0
+  check "and says the assets are attached and the notes must be edited by hand" bash -c "grep -q 'attached' '$ROOT/v3/out.log' && grep -q 'edit' '$ROOT/v3/out.log'"
+  relpub v3 6
+  check "the same build number is refused after its assets were attached (never replaced)" test "$(status v3)" != 0
+
+  # refusals before any release call
+  pubworld v4 9
+  relpub v4 9
+  check "without the snapshot tag the verify-tag guard stops the release and nothing is created" test "$(status v4)" != 0 -a "$(tags v4)" = ""
+  pubworld v5 9; addtag v5 ncw-v33.0.9-1 true cccccccccccccccccccccccccccccccccccccccc "x"
+  relpub v5 9 SNAPSHOT_TAG=ncw-v33.0.9-2
+  check "a snapshot tag that does not fit branch, base and number is refused" test "$(status v5)" != 0 -a "$(n_calls v5 'release create')" = 0
+  relpub v5 9 SNAPSHOT_BASE=33.0.10 SNAPSHOT_TAG=ncw-v33.0.10-1
+  check "a tree whose base release differs from the tag's is refused" test "$(status v5)" != 0 -a "$(n_calls v5 'release create')" = 0
+  relpub v5 9 RELEASE_SCOPE=
+  check "an empty scope is refused" test "$(status v5)" != 0 -a "$(n_calls v5 'release create')" = 0
+  relpub v5 9 SNAPSHOT_BRANCH=ionos-dev-v33
+  check "a branch that is not a snapshot branch is refused" test "$(status v5)" != 0 -a "$(n_calls v5 'release create')" = 0
+  relpub v5 9 KIND=bogus
+  check "an unknown kind is refused" test "$(status v5)" != 0
+  rm "$ROOT/v5/work/out/ncw-flavor2-v33.0.9.9.zip.sha256"
+  relpub v5 9
+  check "the common gate applies: a zip without checksum is refused" test "$(status v5)" != 0 -a "$(n_calls v5 'release create')" = 0
+
+  # --check
+  pubworld v6 9; addtag v6 ncw-v33.0.9-1 true cccccccccccccccccccccccccccccccccccccccc "x"
+  SCRIPT_ARGS=--check relpub v6 9
+  check "--check passes for a good first build without any release call" test "$(status v6)" = 0 -a "$(n_calls v6 'release create')" = 0
+  relpub v6 9
+  newbuild v6 9
+  SCRIPT_ARGS=--check relpub v6 9
+  check "--check refuses a build number that is not larger than the attached ones" test "$(status v6)" != 0
+  newbuild v6 10
+  SCRIPT_ARGS=--check relpub v6 10
+  check "--check passes for a rebuild with a larger number and uploads nothing" test "$(status v6)" = 0 -a "$(n_calls v6 'release upload')" = 0
+
+  # dry run
+  pubworld v7 9; addtag v7 ncw-v33.0.9-1 true cccccccccccccccccccccccccccccccccccccccc "x"
+  relpub v7 9 DRY_RUN=true
+  check "a dry run creates nothing" test "$(status v7)" = 0 -a "$(n_calls v7 'release create')" = 0
+
+  # rehearsal
+  pubworld v8 3; addtag v8 rehearsal-v33.0.9-1 true cccccccccccccccccccccccccccccccccccccccc "x"
+  relpub v8 3 REHEARSAL=true SNAPSHOT_TAG=rehearsal-v33.0.9-1 SNAPSHOT_BRANCH=rehearsal/ncw-v33-1
+  check "a rehearsal release is published on the rehearsal tag" test "$(status v8)" = 0 -a "$(tags v8)" = rehearsal-v33.0.9-1
+  check "it is a pre-release (never the production channel)" test "$(reljson v8 '.[0].prerelease')" = true
+  check "title and body say rehearsal" bash -c "jq -r '.[0].name' '$ROOT/v8/state/releases.json' | grep -qi rehearsal && jq -r '.[0].body' '$ROOT/v8/state/releases.json' | grep -qi 'rehearsal'"
+  check "a rehearsal never touches a real tag" test "$(n_calls v8 'ncw-v33')" = 0
+  pubworld v9 3; addtag v9 rehearsal-v33.0.9-1 true cccccccccccccccccccccccccccccccccccccccc "x"
+  relpub v9 3 REHEARSAL=false SNAPSHOT_TAG=rehearsal-v33.0.9-1 SNAPSHOT_BRANCH=rehearsal/ncw-v33-1
+  check "a rehearsal tag with REHEARSAL=false is refused" test "$(status v9)" != 0
+  relpub v9 3 REHEARSAL=true SNAPSHOT_TAG=ncw-v33.0.9-1 SNAPSHOT_BRANCH=rc/ncw-v33-1
+  check "a real tag with REHEARSAL=true is refused" test "$(status v9)" != 0
+
+  # the dev path is untouched by all of this
+  pubworld v10
+  # shellcheck disable=SC2086
+  run_in v10 ionos-build-publish.sh WORK="$ROOT/v10/work" $PUB
+  check "a dev publish (no KIND) is still a dev pre-release" test "$(tags v10)" = dev-v33.0.9.42 -a "$(reljson v10 '.[0].prerelease')" = true
+
+  # the workflow: retention only for dev
+  check "the workflow prunes dev pre-releases only for dev builds" bash -c "grep -B3 'ionos-build-retain.sh' '$HERE/../workflows/ionos-build.yml' | grep -q \"needs.plan.outputs.kind == 'dev'\""
+}
+
 # ---------------------------------------------------------------- heavy command stubs
 # npm: `ci` makes node_modules, `run build` makes js/built.js; composer: `install` makes vendor/.
 # Every call is logged to $CMD_LOG as "<cwd relative to $CMD_BASE>: <command> <args>".
@@ -349,8 +696,10 @@ cat > "$ROOT/bin/ncw-stub" <<'STUB'
 #!/usr/bin/env bash
 cmd="$1"; shift
 declare -A A
-while [ $# -gt 0 ]; do A["${1#--}"]="$2"; shift 2; done
-echo "ncw $cmd ${A[flavor]:-} kind=${A[kind]:-} bn=${A[build-number]:-} line=${A[line]:-} sc=${A[server-commit]:-} fc=${A[flavors-commit]:-} tree=${A[tree]:-}" >> "$NCW_LOG"
+while [ $# -gt 0 ]; do
+  case "$1" in --*=*) k="${1%%=*}"; A["${k#--}"]="${1#*=}"; shift ;; *) A["${1#--}"]="$2"; shift 2 ;; esac
+done
+echo "ncw $cmd ${A[flavor]:-} kind=${A[kind]:-} bn=${A[build-number]:-} line=${A[line]:-} sc=${A[server-commit]:-} fc=${A[flavors-commit]:-} tree=${A[tree]:-} sb=${A[snapshot-branch]:-} rn=${A[release-number]:-} scope=${A[scope]:-}" >> "$NCW_LOG"
 case "$cmd" in
   resolve) cat "$RESOLVE_DIR/${A[flavor]}.yaml" ;;
   build)
@@ -709,7 +1058,7 @@ sc_recipes() {
   done
 }
 
-ALL="plan retention publish select apps recipes server assemble package"
+ALL="plan release_plan retention publish release_publish select apps recipes server assemble package release_package"
 if [ $# -gt 0 ]; then SELECT=("$@"); else read -r -a SELECT <<< "$ALL"; fi
 for s in "${SELECT[@]}"; do
   echo "scenario: $s"

@@ -1,14 +1,18 @@
-# Dev build: builds the server and every needed out-of-tree app from source, assembles and validates
-# every flavor with the tool pinned by the checked-out dev branch (IONOS/tools), installs every archive
-# fresh on SQLite and probes it (the smoke job: a failure blocks publishing), and publishes the
-# archives as ONE GitHub pre-release with checksums and a build-provenance attestation.
+# Dev and release build: builds the server and every needed out-of-tree app from source, assembles and
+# validates every flavor with the tool pinned by the checked-out branch (IONOS/tools), installs every archive
+# fresh on SQLite and probes it (the smoke job: a failure blocks publishing), and publishes the archives
+# with checksums and a build-provenance attestation: a dev build (from the tip of ionos-dev-v<nn>) as ONE
+# GitHub pre-release on a new tag dev-v<base>.<n>, a release build (from a snapshot branch rc/ncw-v<nn>-<n>,
+# started by ionos-snapshot.yml) as a GitHub release on the snapshot's existing annotated tag.
 # The logic lives in .github/ionos/ionos-build-*.sh and ionos-smoke-*.sh (tested by ionos-build.test.sh
 # and ionos-smoke.test.sh); see .github/ionos/ionos-build.md.
 #
 # WHY ONE FILE FOR ALL BUILDS: GitHub's run_number counts per workflow file, and the build number of
-# every artifact (dev and, with a later ticket, release) is this run number: one counter, always
-# increasing. A second workflow file for release builds would start a second counter. Kind `release`
-# is therefore an input of this file; it is rejected for now.
+# every artifact (dev and release) is this run number: one counter, always increasing. A second workflow
+# file for release builds would start a second counter. Kind `release` is therefore an input of this file;
+# it is accepted only on a snapshot branch (rc/ncw-v<nn>-<n>, or rehearsal/ncw-v<nn>-<n> for a rehearsal, which
+# is derived from the ref and is not an input). Release number, snapshot branch and scope are read from the
+# snapshot's annotated tag by the plan job, never taken from an input.
 #
 # NOTE: scheduled runs and manual runs only exist once this file is on the repository's DEFAULT
 # branch, which a person switches to the dev branch (a separate settings ticket). Until then nothing
@@ -22,7 +26,7 @@ on:
   workflow_dispatch:
     inputs:
       kind:
-        description: 'Build kind (release builds arrive with the snapshot ticket)'
+        description: 'Build kind: dev (from ionos-dev-v<nn>) or release (only from a snapshot branch rc/ncw-v<nn>-<n>; started by the IONOS snapshot workflow)'
         type: choice
         options: [dev, release]
         default: dev
@@ -54,9 +58,19 @@ jobs:
     timeout-minutes: 10
     outputs:
       build: ${{ steps.plan.outputs.build }}
+      kind: ${{ steps.plan.outputs.kind }}
       line: ${{ steps.plan.outputs.line }}
       server_commit: ${{ steps.plan.outputs.server_commit }}
       flavors_commit: ${{ steps.plan.outputs.flavors_commit }}
+      # release builds only: read from the annotation of the snapshot tag
+      tag: ${{ steps.plan.outputs.tag }}
+      base_release: ${{ steps.plan.outputs.base_release }}
+      release_nr: ${{ steps.plan.outputs.release_nr }}
+      snapshot_branch: ${{ steps.plan.outputs.snapshot_branch }}
+      rehearsal: ${{ steps.plan.outputs.rehearsal }}
+      scope: ${{ steps.plan.outputs.scope }}
+      source_branch: ${{ steps.plan.outputs.source_branch }}
+      source_commit: ${{ steps.plan.outputs.source_commit }}
     steps:
       # The repository has about 7.6 GB of history: one commit, only the scripts. The submodule
       # entry (the flavors commit) is read from the commit itself.
@@ -77,6 +91,7 @@ jobs:
           FORCE: ${{ inputs.force }}
           FLAVORS: ${{ inputs.flavors }}
           REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
         run: bash .github/ionos/ionos-build-plan.sh
 
   build:
@@ -93,7 +108,8 @@ jobs:
       - name: Set the work folder
         run: echo "WORK=$RUNNER_TEMP/ionos-build" >> "$GITHUB_ENV"
 
-      - name: Check out the dev branch
+      # the dev branch, or the snapshot branch of a release build
+      - name: Check out the branch of the run
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
         with:
           fetch-depth: 1
@@ -138,6 +154,11 @@ jobs:
           LINE: ${{ needs.plan.outputs.line }}
           SERVER_COMMIT: ${{ needs.plan.outputs.server_commit }}
           FLAVORS_COMMIT: ${{ needs.plan.outputs.flavors_commit }}
+          KIND: ${{ needs.plan.outputs.kind }}
+          SNAPSHOT_BASE: ${{ needs.plan.outputs.base_release }}
+          SNAPSHOT_BRANCH: ${{ needs.plan.outputs.snapshot_branch }}
+          RELEASE_NR: ${{ needs.plan.outputs.release_nr }}
+          RELEASE_SCOPE: ${{ needs.plan.outputs.scope }}
         run: bash .github/ionos/ionos-build-package.sh
 
       - name: Hand the archives over to the publish job
@@ -232,6 +253,15 @@ jobs:
       BUILD_NUMBER: ${{ github.run_number }}
       SERVER_COMMIT: ${{ needs.plan.outputs.server_commit }}
       FLAVORS_COMMIT: ${{ needs.plan.outputs.flavors_commit }}
+      KIND: ${{ needs.plan.outputs.kind }}
+      SNAPSHOT_TAG: ${{ needs.plan.outputs.tag }}
+      SNAPSHOT_BASE: ${{ needs.plan.outputs.base_release }}
+      SNAPSHOT_BRANCH: ${{ needs.plan.outputs.snapshot_branch }}
+      RELEASE_NR: ${{ needs.plan.outputs.release_nr }}
+      REHEARSAL: ${{ needs.plan.outputs.rehearsal }}
+      RELEASE_SCOPE: ${{ needs.plan.outputs.scope }}
+      SOURCE_BRANCH: ${{ needs.plan.outputs.source_branch }}
+      SOURCE_COMMIT: ${{ needs.plan.outputs.source_commit }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
       - name: Set the work folder
@@ -265,8 +295,11 @@ jobs:
           BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
         run: cp "$BUNDLE_PATH" "$WORK/out/ncw-build-$BUILD_NUMBER.attestation.jsonl"
 
-      - name: Publish the pre-release
+      # a dev build: a pre-release on a new tag; a release build: a release on the existing snapshot tag
+      - name: Publish the release or pre-release
         run: bash .github/ionos/ionos-build-publish.sh
 
+      # release builds never prune anything
       - name: Prune old dev pre-releases
+        if: needs.plan.outputs.kind == 'dev'
         run: bash .github/ionos/ionos-build-retain.sh

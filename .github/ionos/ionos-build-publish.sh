@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Publishes the archives of a run as ONE GitHub pre-release. Needs gh and the files the build job handed
+# Publishes the archives of a run: a dev build as ONE GitHub pre-release on a new tag dev-v<base>.<n>, a release build
+# (KIND=release) as a GitHub release on the existing snapshot tag (ionos-build-release.sh). Needs gh and the files the build job handed
 # over in $WORK. With --check it only runs the gate (everything below that refuses) and publishes nothing:
 # the workflow runs it before the attestation, so only archives that pass are attested. Refuses (before any release call) when an archive has no checksum, when a flavor of
 # the run has no archive, when the run did not validate every flavor, or when the release for this build number already exists.
@@ -13,6 +14,8 @@
 #   RUN_URL             link to the workflow run
 #   GITHUB_REPOSITORY   owner/name of this fork
 #   DRY_RUN             "true" to check everything and print the command instead of running it
+#   KIND                dev (default) or release; a release build also needs the SNAPSHOT_* and RELEASE_SCOPE variables of
+#                       ionos-build-release.sh
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -39,6 +42,8 @@ OUT="$WORK/out"
 [[ $BUILD_NUMBER =~ ^[1-9][0-9]*$ ]] || die "BUILD_NUMBER '$BUILD_NUMBER' is not a positive integer"
 BASE=$(cat "$WORK/base-release")
 [[ $BASE =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "base release '$BASE' is not <major>.<minor>.<patch>"
+KIND=${KIND:-dev}
+case "$KIND" in dev|release) ;; *) die "unknown build kind '$KIND', expected dev or release" ;; esac
 TAG="dev-v$BASE.$BUILD_NUMBER"
 
 cmp -s "$WORK/validated" "$WORK/flavors.txt" \
@@ -63,6 +68,13 @@ done < "$WORK/flavors.txt"
 SCOPE=$(cat "$WORK/scope" 2>/dev/null || true)
 [ "$SCOPE" = all ] || [ "$SCOPE" = subset ] || die "the scope of the run is '$SCOPE', expected all or subset"
 for b in "$OUT"/*.attestation.jsonl; do assets+=("$b"); done
+
+if [ "$KIND" = release ]; then
+  # shellcheck source=ionos-build-release.sh
+  . "$HERE/ionos-build-release.sh"
+  publish_release
+  exit 0
+fi
 
 if gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
   die "the release $TAG exists already: a re-run of a finished run keeps its build number; start a new run"

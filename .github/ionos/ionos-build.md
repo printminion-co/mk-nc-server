@@ -1,7 +1,8 @@
-# Dev build pipeline (line 33)
+# Build pipeline (line 33): dev and release builds
 
 `.github/workflows/ionos-build.yml` builds the server and the out-of-tree apps from source, builds and
-validates every flavor with the flavors tool, and publishes the archives as one GitHub pre-release.
+validates every flavor with the flavors tool, and publishes the archives: a dev build as one GitHub
+pre-release, a release build (see "Release builds" below) as a GitHub release.
 The logic is in `ionos-build-*.sh` (helpers in `ionos-lib.sh`); the workflow only passes the
 environment. Test it with `bash .github/ionos/ionos-build.test.sh` (seconds: npm, composer and the tool
 are stubs, `gh` is a stub with a list of releases).
@@ -9,20 +10,20 @@ are stubs, `gh` is a stub with a list of releases).
 ## One workflow file, one build number
 
 The build number is `github.run_number`, which GitHub counts per workflow file. The design wants one
-counter shared by dev and release builds, so release builds will be another `kind` of this same file.
-Input `kind` accepts `release` but the run fails at once with a message: release builds arrive with the
-snapshot ticket. All flavors of a run share the build number. A scheduled run that is skipped (see below)
+counter shared by dev and release builds, so release builds are another `kind` of this same file (a second
+workflow file would start a second counter). Input `kind` is `dev` (default) or `release`; a release build is
+accepted only on a snapshot branch, see "Release builds". All flavors of a run share the build number. A scheduled run that is skipped (see below)
 still uses a number, so numbers can have gaps; they always increase.
 
 Triggers: `schedule` (05:07 UTC daily) and `workflow_dispatch` with inputs `kind` (default `dev`),
 `flavors` (comma separated, default every folder of `IONOS/flavors`), `force` and `smoke_break` (see the smoke test below). Scheduled and manual
 runs only exist once the file is on the default branch; a person switches that to the dev branch (a
-separate settings ticket). The run must be on `ionos-dev-v<nn>`: the line is derived from the branch name.
+separate settings ticket). A dev run must be on `ionos-dev-v<nn>`: the line is derived from the branch name.
 
 ## Jobs and steps
 
-`plan` (read-only token, one commit, only `.github/ionos`): `ionos-build-plan.sh` rejects `kind`
-release, checks the names in the `flavors` input, derives the line, and decides. A manual run always
+`plan` (read-only token, one commit, only `.github/ionos`): `ionos-build-plan.sh` checks the names in the
+`flavors` input, derives the line, and decides; for `kind` release it does what "Release builds" says. A manual run always
 builds. A scheduled run skips (logged, the run succeeds) only when the newest dev pre-release (highest
 build number among published pre-releases whose tag is `dev-v<a>.<b>.<c>.<n>`) covered ALL flavors
 (its body line `flavors_scope: all`) and its `server_commit` (`HEAD`) and `flavors_commit` (the `IONOS`
@@ -89,19 +90,68 @@ no cancelling) runs everything that executes app code and ends by uploading the 
    release for the tag does not exist yet. Nothing is attested before it passes.
 3. `actions/attest-build-provenance` on the zips; the bundle is attached to the release as
    `ncw-build-<n>.attestation.jsonl`. Check with `gh attestation verify <zip> -R <repo>`.
-4. `ionos-build-publish.sh`: runs the gate again, then one `gh release create` with the default token: tag
+4. `ionos-build-publish.sh`: (dev builds; for release builds see below) runs the gate again, then one `gh release create` with the default token: tag
    `dev-v<base release>.<build number>` on the built commit (`--target <sha>`, for example
    `dev-v33.0.9.42`), `--prerelease`, title `Dev build <n> (v<base> base)`, assets every zip, its `.sha256`
    and the attestation bundle. The body has machine-readable lines (`server_commit:`, `flavors_commit:`,
    `build_number:`, `base_release:`, `flavors_scope:`, `flavors:`), the flavor list and a link to the run.
    An existing release for the tag (a re-run of a finished run keeps its number) fails and touches nothing.
-5. `ionos-build-retain.sh`, a separate step: keeps the newest 14 dev pre-releases (`KEEP`, default 14) and
+5. `ionos-build-retain.sh`, a separate step, only for dev builds (`if: needs.plan.outputs.kind == 'dev'`): keeps the newest 14 dev pre-releases (`KEEP`, default 14) and
    deletes older ones with `gh release delete --cleanup-tag --yes`. Only published pre-releases whose tag is
    exactly `dev-v<a>.<b>.<c>.<n>` are considered; anything else is never touched. Deletions are logged.
    `DRY_RUN=true` only prints.
 
 The default `GITHUB_TOKEN` is enough: the tag points at an existing commit and no workflow file is
 pushed. All actions are GitHub's own and pinned to a commit SHA.
+
+## Release builds
+
+A release build is the same workflow file with `kind` release, started by `ionos-snapshot.yml` right after it
+created the snapshot (`gh workflow run ionos-build.yml --ref rc/ncw-v<nn>-<n> -f kind=release`; a
+`workflow_dispatch` is allowed with the default token) or by a person for a REBUILD of the same snapshot
+(Actions, Run workflow, branch `rc/ncw-v33-1`, kind release; or the same `gh` command). How to cut a release: `ionos-snapshot.md`.
+
+**Where it may run.** `ionos-build-plan.sh` accepts `kind` release only for a manual run on a BRANCH named
+`rc/ncw-v<nn>-<n>` (a rehearsal: `rehearsal/ncw-v<nn>-<n>`), with an empty `flavors` input and no `force`; any other
+ref (the dev branch, a tag, a candidate) is refused, and `kind` dev is refused on a snapshot branch. The rehearsal flag is
+derived from the ref prefix and is not an input.
+
+**Where the facts come from.** The plan job reads the ANNOTATED tag of the snapshot (`read_snapshot_tag` in `ionos-lib.sh`,
+through the API: `git/matching-refs/tags/ncw-v<nn>.` filtered to `ncw-v<nn>.<x>.<y>-<n>`, then `git/tags/<sha>`). It refuses unless
+exactly one such tag exists, it is annotated (a lightweight tag cannot carry the scope), it points at the commit the run built,
+and its annotation agrees with the branch name (release number, line, snapshot branch, rehearsal flag; the tag name carries the
+annotation's base release). From the annotation it takes release number, snapshot branch, base release, scope, source branch
+and source commit, and hands them to the other jobs as job outputs (which reach scripts only through `env:`). The scope is
+therefore never an input of the build and cannot drift from the tag. A tag cannot be moved or deleted once the settings
+wizard's ruleset is on, so every rebuild reads the same annotation.
+
+**Build.** `ionos-build-package.sh` runs `ncw build --kind release --snapshot-branch <branch> --release-number <n> --scope <text>`, which
+puts kind, snapshot branch, release number and scope into `version.json` (spec 04). It first checks that the base release of
+the built tree is the one in the tag name. A release build never skips because nothing changed and prunes nothing. The build
+number is the run number, as for dev builds. The smoke job runs unchanged and blocks publishing.
+
+**Publish** (`ionos-build-release.sh`, sourced by `ionos-build-publish.sh` when `KIND=release`; the gate before it is the same):
+
+- A GitHub release on the EXISTING snapshot tag: `gh release create <tag> --verify-tag --latest=false` (no `--target`, so the
+  tag is never created and a missing tag is an error), not a pre-release, title = the tag name (`ncw-v33.0.9-1`). `--latest=false` is
+  deliberate: which release is live is a decision of the deployment, not of GitHub's "latest" badge.
+- Body: the scope (quoted), release number, line and base release, snapshot branch and tag with the source branch and commit,
+  the table of EVERY archive of the release (flavor, file with download link, build number, sha256; newest build first), how to
+  verify (`sha256sum -c`, `gh attestation verify <archive> -R <repo>`), then machine-readable lines (`release_nr`,
+  `base_release`, `snapshot_branch`, `snapshot_tag`, `source_*`, `server_commit`, `flavors_commit`, `scope`, `latest_build_number`).
+- Assets: every zip, its `.sha256` and the attestation bundle `ncw-build-<n>.attestation.jsonl`.
+- A rebuild (a new run on the same branch, a new run number): the release exists, so the new assets are attached with
+  `gh release upload` WITHOUT `--clobber` and the body is rewritten with `gh release edit`. The table is rebuilt from the
+  `.sha256` assets of the release (downloaded) plus the new ones, not from the old body, so no row is lost. Before anything
+  is attached the build number must be strictly larger than every build number already attached (archives, checksums and
+  attestation bundles count), else the run fails: assets are never replaced or deleted, and a re-run of a finished run (same
+  number) is refused. If the upload fails the body is not touched; if only the body update fails, the assets are attached
+  and the error says so (edit the notes by hand; the next rebuild rewrites the table anyway). `ionos-build-publish.sh --check`
+  (before the attestation) applies the same rule.
+- A rehearsal (`rehearsal/` branch) publishes a PRE-release titled "... (rehearsal, not a release)" with a warning on top, so it can
+  never be taken for the production channel. Everything else is the same code path.
+
+Dev behavior is unchanged (dev tags, pre-release, retention).
 
 ## Fresh-install smoke test
 
@@ -223,7 +273,8 @@ What a local run cannot show: the runner's PHP is also 8.3, but its Composer ver
 
 ## Tokens
 
-The `plan` and `publish` jobs only use the default `GITHUB_TOKEN` and only call this repository's API. The
+The `plan` and `publish` jobs only use the default `GITHUB_TOKEN` and only call this repository's API (a release build's plan
+job reads refs and tag objects with it; the snapshot workflow, not this one, uses `IONOS_SYNC_TOKEN`). The
 build never uses the sync token and never reads `nextcloud/*` through the API, so the `nextcloud`
 organization's rule against fine-grained tokens with a lifetime over 366 days does not touch it (see
 `ionos-app-pins.md`). Submodules are fetched over git without credentials.
