@@ -681,6 +681,7 @@ sc_gate() {
   needs_publish=$(awk '/^  publish:$/ {f=1} f && /^    needs:/ {print; exit}' "$wf")
   needs_gate=$(awk '/^  gate:$/ {f=1} f && /^    needs:/ {print; exit}' "$wf" | sed 's/^    needs: *//; s/[][,]/ /g')
   check "workflow: publish needs the gate (and so skips when it fails)" grep -q '\bgate\b' <<<"$needs_publish"
+  check "workflow: publish has a condition with a status function (a skipped job anywhere upstream, the MariaDB job on dev builds, skips a job without one) and names the results it needs" bash -c "awk '/^  publish:\$/,0' '$wf' | sed -n '1,30p' | grep -E '^    if:' | grep -qE '!cancelled\(\)|always\(\)' && awk '/^  publish:\$/,0' '$wf' | sed -n '1,30p' | grep -E '^    if:' | grep -q \"needs.gate.result == 'success'\" && awk '/^  publish:\$/,0' '$wf' | sed -n '1,30p' | grep -E '^    if:' | grep -q \"needs.build.result == 'success'\" && awk '/^  publish:\$/,0' '$wf' | sed -n '1,30p' | grep -E '^    if:' | grep -q \"needs.plan.result == 'success'\""
   check "workflow: publish does not need a test job directly (the gate decides)" bash -c "! grep -qE 'smoke|upgrade' <<<'$needs_publish'"
   all=$(grep -E '^  [a-z][a-z-]*:$' "$wf" | sed 's/[ :]//g' | grep -vxE 'gate|publish|schedule' | sort | tr '\n' ' ')
   got=$(tr ' ' '\n' <<<"$needs_gate" | grep . | sort | tr '\n' ' ')

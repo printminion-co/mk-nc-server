@@ -481,9 +481,12 @@ jobs:
   publish:
     # Runs no app code at all: only the scripts of this repository and the archives of the build job.
     name: Attest, publish and prune
-    # `gate` fails unless every required test succeeded (the MariaDB one only for release builds); a failed or
-    # cancelled or skipped need makes this job skip, the default behavior of `needs`.
+    # `gate` fails unless every required test succeeded (the MariaDB one only for release builds). A job that needs
+    # a skipped job anywhere upstream (the MariaDB job is skipped on dev builds) is skipped too unless its condition
+    # has a status function, so this one names the three results it needs and starts with `!cancelled()`: it
+    # publishes only when plan, build and the gate all succeeded, whatever was skipped before the gate.
     needs: [plan, build, gate]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.build.result == 'success' && needs.gate.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
