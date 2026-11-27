@@ -1,0 +1,80 @@
+# Cut a snapshot and start its release build: creates the branch rc/ncw-v<nn>-<release_nr> at the tip of the
+# source branch (no new commit) and the ANNOTATED tag ncw-v<base release>-<release_nr> (its annotation holds the
+# scope, release number, source branch and commit), refuses a release number that is already used, and starts
+# the release build explicitly (gh workflow run ionos-build.yml --ref <branch> -f kind=release): pushes made with
+# a token do not start it. With `rehearsal` the names are rehearsal/ncw-v<nn>-<n> and rehearsal-v<base>-<n>, so
+# the real names are never used by a rehearsal.
+# The logic lives in .github/ionos/ionos-snapshot.sh (tested by ionos-snapshot.test.sh); see
+# .github/ionos/ionos-snapshot.md.
+#
+# NOTE: a manual run only exists once this file is on the repository's DEFAULT branch, which a person switches
+# to the dev branch (a separate settings ticket).
+#
+# SECRET IONOS_SYNC_TOKEN (ADR 0007): the snapshot workflows use a token with the workflow scope. Without the
+# secret the run falls back to the default token and says so in the log. Starting the release build
+# (workflow_dispatch) is allowed with either token. Refs are created through the API and never updated or deleted.
+
+name: IONOS snapshot
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_nr:
+        description: 'Release number: a positive integer, restarts at 1 for each line; a used number is refused'
+        type: string
+        required: true
+      source_branch:
+        description: 'Branch to freeze, ionos-dev-v<nn>'
+        type: string
+        required: true
+        default: ionos-dev-v33
+      scope:
+        description: 'What this release is for: one line, at most 500 characters; stored in the tag, the release notes and version.json'
+        type: string
+        required: true
+      rehearsal:
+        description: 'Rehearsal: use rehearsal/ncw-v<nn>-<n> and rehearsal-v<base>-<n> instead of the real names'
+        type: boolean
+        default: false
+      dry_run:
+        description: 'Check everything and print what would be done; create and start nothing'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ionos-snapshot
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    name: Create the snapshot and start the release build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # the default token (the fallback) needs contents: write to create refs and actions: write to start the build
+      contents: write
+      actions: write
+    steps:
+      # Only the script is needed; the repository has about 7.6 GB of history. The script reads and writes refs
+      # through the API and never clones it.
+      - name: Check out the snapshot script
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          fetch-depth: 1
+          sparse-checkout: .github/ionos
+          persist-credentials: false
+
+      - name: Snapshot
+        env:
+          GH_TOKEN: ${{ secrets.IONOS_SYNC_TOKEN || github.token }}
+          HAS_SYNC_TOKEN: ${{ secrets.IONOS_SYNC_TOKEN != '' }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          RELEASE_NR: ${{ inputs.release_nr }}
+          SOURCE_BRANCH: ${{ inputs.source_branch }}
+          SCOPE: ${{ inputs.scope }}
+          REHEARSAL: ${{ inputs.rehearsal }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: bash .github/ionos/ionos-snapshot.sh

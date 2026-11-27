@@ -123,3 +123,75 @@ resolved_enable_after_install() {
   awk '/^[A-Za-z_]+:/ { sec = $1; sub(/:$/, "", sec); next }
        sec == "enable_after_install" && /^  - / { print $2 }' "$1"
 }
+
+# ---- snapshots and release builds (ionos-snapshot*.sh, ionos-build-*.sh)
+
+# The one definition of the names. <rehearsal> is true or false: a rehearsal uses its own prefixes, so the real
+# names are never used by one (rc/* and ncw-v* are protected from deletion, rehearsal refs are not).
+#   branch  rc/ncw-v<line>-<n>          rehearsal/ncw-v<line>-<n>
+#   tag     ncw-v<base>-<n>             rehearsal-v<base>-<n>        (annotated)
+snapshot_branch_name() { # snapshot_branch_name <rehearsal> <line> <release number>
+  if [ "$1" = true ]; then echo "rehearsal/ncw-v$2-$3"; else echo "rc/ncw-v$2-$3"; fi
+}
+snapshot_tag_name() { # snapshot_tag_name <rehearsal> <base release> <release number>
+  if [ "$1" = true ]; then echo "rehearsal-v$2-$3"; else echo "ncw-v$2-$3"; fi
+}
+# The tag prefix without the base release, for matching-refs: ncw-v33. or rehearsal-v33.
+snapshot_tag_search_prefix() { if [ "$1" = true ]; then echo "rehearsal-v$2."; else echo "ncw-v$2."; fi; }
+# A snapshot branch: rc/ncw-v<line>-<n> or rehearsal/ncw-v<line>-<n>.
+SNAPSHOT_BRANCH_RE='^(rc|rehearsal)/ncw-v([0-9]+)-([1-9][0-9]*)$'
+# The scope text: one line, no control characters, no leading or trailing blank, at most 500 characters.
+SCOPE_MAX=500
+valid_scope() {
+  local s="$1"
+  [ -n "$s" ] && [ "${#s}" -le "$SCOPE_MAX" ] || return 1
+  [[ $s != *[[:cntrl:]]* ]] || return 1
+  [[ $s =~ ^[^[:space:]] && $s =~ [^[:space:]]$ ]]
+}
+
+# The annotation of a snapshot tag. Single line values, the scope last, so no value can inject another key.
+snapshot_tag_message() { # <rehearsal> <line> <base> <nr> <source branch> <source commit> <scope>
+  local tag branch; tag=$(snapshot_tag_name "$1" "$3" "$4"); branch=$(snapshot_branch_name "$1" "$2" "$4")
+  printf '%s\n\n' "$tag: snapshot of $5 for the release build"
+  printf 'release_nr: %s\nline: %s\nbase_release: %s\nsource_branch: %s\nsource_commit: %s\nsnapshot_branch: %s\nrehearsal: %s\nscope: %s\n' \
+    "$4" "$2" "$3" "$5" "$6" "$branch" "$1" "$7"
+}
+# The value of "<key>: <value>" in an annotation read from stdin (the first such line).
+tag_message_value() { sed -n "s/^$1: //p" | head -n1; }
+
+# read_snapshot_tag <owner/name> <branch of the run> <commit built>: the facts of the snapshot a release build
+# builds, read from the ANNOTATED tag of that snapshot. Dies unless the branch is a snapshot branch, exactly one
+# tag of that release number and line exists, it is annotated, points at the built commit, and its annotation agrees
+# with the branch name. Sets SNAP_TAG SNAP_BASE SNAP_NR SNAP_LINE SNAP_REHEARSAL SNAP_BRANCH SNAP_SCOPE
+# SNAP_SOURCE_BRANCH SNAP_SOURCE_COMMIT (read by the callers). Needs gh and jq.
+# shellcheck disable=SC2034
+read_snapshot_tag() {
+  local repo="$1" ref="$2" commit="$3" prefix line nr re found nfound tagref objtype objsha tagjson msg v
+  [[ $ref =~ $SNAPSHOT_BRANCH_RE ]] || die "'$ref' is not a snapshot branch (rc/ncw-v<nn>-<n>)"
+  prefix=${BASH_REMATCH[1]}; line=${BASH_REMATCH[2]}; nr=${BASH_REMATCH[3]}
+  SNAP_REHEARSAL=false; [ "$prefix" = rehearsal ] && SNAP_REHEARSAL=true
+  re="^refs/tags/$([ "$SNAP_REHEARSAL" = true ] && echo rehearsal || echo ncw)-v${line}\\.[0-9]+\\.[0-9]+-${nr}\$"
+  found=$(gh api --paginate "repos/$repo/git/matching-refs/tags/$(snapshot_tag_search_prefix "$SNAP_REHEARSAL" "$line")" \
+    | jq -r --arg re "$re" '.[] | select(.ref | test($re)) | [.ref, .object.type, .object.sha] | @tsv') \
+    || die "could not list the tags of $repo"
+  nfound=$(grep -c . <<<"$found" || true)
+  [ "$nfound" -ge 1 ] || die "no snapshot tag for $ref: the snapshot workflow creates the branch and its annotated tag; a branch made any other way is not built as a release"
+  [ "$nfound" -eq 1 ] || die "more than one snapshot tag matches $ref: $(cut -f1 <<<"$found" | paste -sd' ')"
+  IFS=$'\t' read -r tagref objtype objsha <<<"$found"
+  SNAP_TAG=${tagref#refs/tags/}
+  [ "$objtype" = tag ] || die "the tag $SNAP_TAG is a lightweight tag (it points at a $objtype): the scope lives in the annotation of an annotated tag"
+  tagjson=$(gh api "repos/$repo/git/tags/$objsha") || die "could not read the annotated tag $SNAP_TAG"
+  [ "$(jq -r '.object.type' <<<"$tagjson")" = commit ] || die "the tag $SNAP_TAG does not point at a commit"
+  v=$(jq -r '.object.sha' <<<"$tagjson")
+  [ "$v" = "$commit" ] || die "the tag $SNAP_TAG points at $v but this run builds $commit: the branch $ref and its tag disagree"
+  msg=$(jq -r '.message' <<<"$tagjson")
+  SNAP_BRANCH=$(tag_message_value snapshot_branch <<<"$msg"); SNAP_NR=$(tag_message_value release_nr <<<"$msg")
+  SNAP_LINE=$(tag_message_value line <<<"$msg"); SNAP_BASE=$(tag_message_value base_release <<<"$msg")
+  SNAP_SCOPE=$(tag_message_value scope <<<"$msg"); SNAP_SOURCE_BRANCH=$(tag_message_value source_branch <<<"$msg")
+  SNAP_SOURCE_COMMIT=$(tag_message_value source_commit <<<"$msg")
+  [ "$SNAP_BRANCH" = "$ref" ] || die "the annotation of $SNAP_TAG names the snapshot branch '$SNAP_BRANCH', not $ref"
+  { [ "$SNAP_NR" = "$nr" ] && [ "$SNAP_LINE" = "$line" ]; } || die "the annotation of $SNAP_TAG disagrees with $ref about the release number or line"
+  [ "$(tag_message_value rehearsal <<<"$msg")" = "$SNAP_REHEARSAL" ] || die "the annotation of $SNAP_TAG disagrees with $ref about rehearsal"
+  [ "$SNAP_TAG" = "$(snapshot_tag_name "$SNAP_REHEARSAL" "$SNAP_BASE" "$nr")" ] || die "the annotation of $SNAP_TAG names the base release '$SNAP_BASE', which does not fit the tag name"
+  valid_scope "$SNAP_SCOPE" || die "the annotation of $SNAP_TAG has no usable scope"
+}
