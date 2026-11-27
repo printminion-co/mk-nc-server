@@ -17,6 +17,7 @@ use OCA\Theming\Themes\LightTheme;
 use OCP\IConfig;
 use OCP\IUser;
 use OCP\IUserSession;
+use OCP\Server;
 use Psr\Log\LoggerInterface;
 
 class ThemesService {
@@ -44,6 +45,41 @@ class ThemesService {
 			$darkHighContrastTheme->getId() => $darkHighContrastTheme,
 			$dyslexiaFont->getId() => $dyslexiaFont,
 		];
+
+		$this->registerExtraThemes();
+	}
+
+	/**
+	 * Register the theme classes listed in the system setting `ncw.themes`
+	 * (a list of fully qualified class names), resolved through the server
+	 * container like the built-in ones. A class that does not exist, is not
+	 * an ITheme, cannot be created or reuses the id of a registered theme is
+	 * skipped with one warning instead of breaking the page.
+	 */
+	private function registerExtraThemes(): void {
+		$classes = $this->config->getSystemValue('ncw.themes', []);
+		if (!is_array($classes)) {
+			return;
+		}
+
+		foreach ($classes as $class) {
+			try {
+				if (!is_string($class) || !class_exists($class) || !is_subclass_of($class, ITheme::class)) {
+					throw new \InvalidArgumentException('the class does not exist or does not implement ITheme');
+				}
+				/** @var ITheme $theme */
+				$theme = Server::get($class);
+				if (isset($this->themesProviders[$theme->getId()])) {
+					throw new \InvalidArgumentException('a theme with the id "' . $theme->getId() . '" is already registered');
+				}
+				$this->themesProviders[$theme->getId()] = $theme;
+			} catch (\Throwable $e) {
+				$this->logger->warning('Ignoring theme from ncw.themes: ' . $e->getMessage(), [
+					'class' => is_string($class) ? $class : get_debug_type($class),
+					'exception' => $e,
+				]);
+			}
+		}
 	}
 
 	/**
