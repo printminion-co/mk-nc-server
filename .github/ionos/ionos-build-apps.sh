@@ -6,71 +6,63 @@
 #                                               requires vendor/autoload.php even when no package is needed)
 #   npm ci && npm run build                     when package.json has a build script (lifecycle scripts run:
 #                                               vue-demi's postinstall is needed by text, viewer, photos)
-# with the checks of default_recipe below: committed built files are deleted first and the build must
-# produce new ones. Needs jq.
+# with the checks of default_recipe (ionos-build-default-recipe.sh): committed built files are deleted first and the
+# build must produce new ones. Needs jq, rsync and git.
 #
-# Environment:  WORK, NPM (default npm), COMPOSER (default composer), RECIPES_DIR
+# The app build cache (see ionos-build.md, "Cache", and ionos-cache-lib.sh): with CACHE_DIR set and NO_CACHE not
+# true, an app is not built when the cache folder holds a build of it under exactly the freshly computed key
+# (app commit, recipe, Node, PHP, Composer major) and its tree still matches the checksum of its meta.json; the
+# tree is then copied into the app folder. Every other app is built and stored in the folder. The submodule is
+# always initialised (the assembly and the pins need the git checkout). If anything was stored or dropped, the
+# script writes cache_save=true and cache_key=<key of the folder> to $GITHUB_OUTPUT, for the save step of the
+# workflow. With NO_CACHE=true the folder is neither read nor written.
+# Always written: $WORK/app-builds.json, {"<app id>": {"key": ..., "checksum": ...}} of every USED build
+# (reused or fresh), which ionos-build-package.sh hands to `ncw build --cache-keys`.
+#
+# Environment:  WORK, NPM (default npm), COMPOSER (default composer), RECIPES_DIR, CACHE_DIR, NO_CACHE,
+#               DEFAULT_RECIPE_FILE (default: ionos-build-default-recipe.sh next to this script)
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 export LOG_PREFIX=ionos-build
 # shellcheck source=ionos-lib.sh
 . "$HERE/ionos-lib.sh"
+# shellcheck source=ionos-cache-lib.sh
+. "$HERE/ionos-cache-lib.sh"
 
 ROOT=$(build_root)
 WORK=${WORK:?WORK is required}
 RECIPES_DIR=${RECIPES_DIR:-$ROOT/.github/ionos/build-recipes}
 read -r -a NPM_CMD <<<"${NPM:-npm}"
 read -r -a COMPOSER_CMD <<<"${COMPOSER:-composer}"
+DEFAULT_RECIPE_FILE=${DEFAULT_RECIPE_FILE:-$HERE/ionos-build-default-recipe.sh}
+# shellcheck source=ionos-build-default-recipe.sh
+. "$DEFAULT_RECIPE_FILE"
+CACHE_DIR=${CACHE_DIR:-}
+USE_CACHE=false
+if [ -n "$CACHE_DIR" ] && [ "${NO_CACHE:-false}" != true ]; then USE_CACHE=true; fi
+BUILDS="$WORK/app-builds.json"
 
-# The default recipe, run in the app folder (APP is set). Built output is never trusted, and nothing that git
-# tracks is ever deleted (js/ and css/ can hold handwritten sources):
-#  - an app with committed js/ or css/ files, no package.json build script and no recipe is an error: it
-#    cannot be rebuilt from source here (add .github/ionos/build-recipes/<app>.sh, even a no-op one that
-#    says the files are sources);
-#  - composer.json (always, also when it requires only php, ext-* or bamarni/*): untracked and ignored files
-#    of vendor/ are removed, `composer install --no-dev -a --no-scripts` runs (post-install-cmd, for example
-#    `composer bin all install`, is dev tooling) and vendor/autoload.php must exist, else the app fails;
-#  - a package.json build script: untracked and ignored files of js/ and css/ are removed, a marker is
-#    taken, `npm ci && npm run build` runs, and the build must have written at least one
-#    file newer than the marker in js/ or css/ (so a build that writes nothing fails);
-#  - node_modules is deleted afterwards.
-# Every command ends in `|| return 1`: this runs under `||` in the caller, where `set -e` does nothing.
-# Messages are plain lines naming the app; the one ::error:: of the step lists all failing apps.
-default_recipe() {
-  local has_composer=false has_build=false marker
-  # composer always runs when there is a composer.json: Nextcloud apps load composer/autoload.php, which requires
-  # ../vendor/autoload.php even when the app needs no package (calendar, contacts); without it the install dies
-  if [ -f composer.json ]; then has_composer=true; fi
-  if [ -f package.json ] && jq -e '.scripts.build' package.json >/dev/null; then has_build=true; fi
+# record_build <id> <key> <checksum>: the used build of an app, for version.json
+record_build() {
+  jq --arg id "$1" --arg k "$2" --arg c "$3" '. + {($id): {key: $k, checksum: $c}}' "$BUILDS" > "$BUILDS.tmp" || return 1
+  mv "$BUILDS.tmp" "$BUILDS"
+}
 
-  if [ "$has_build" = false ] && [ -n "$(git ls-files -- js css | head -n1)" ]; then
-    echo "ionos-build: $APP has committed js/ or css/ files but no package.json build script and no recipe in .github/ionos/build-recipes/$APP.sh: it cannot be built from source" >&2
-    return 1
-  fi
-  if [ "$has_composer" = true ]; then
-    git clean -fdxq -- vendor || return 1
-    "${COMPOSER_CMD[@]}" install --no-dev -a --no-scripts --no-interaction --quiet || return 1
-    [ -f vendor/autoload.php ] || { echo "ionos-build: $APP has a composer.json but composer install produced no vendor/autoload.php" >&2; return 1; }
-  fi
-  if [ "$has_build" = true ]; then
-    git clean -fdxq -- js css || return 1
-    "${NPM_CMD[@]}" ci || return 1
-    marker=$(mktemp) || return 1
-    sleep 1
-    "${NPM_CMD[@]}" run build || { rm -f "$marker"; return 1; }
-    if [ -z "$(find js css -type f -newer "$marker" -print -quit 2>/dev/null)" ]; then
-      rm -f "$marker"
-      echo "ionos-build: $APP has a build script but the build wrote no new file in js/ or css/ (add a recipe if it builds elsewhere)" >&2
-      return 1
-    fi
-    rm -f "$marker"
-  fi
-  rm -rf node_modules
+# store_entry <id> <path> <key> <commit> <checksum>: the built app folder (without .git) and its meta.json
+# replace the entry of the app in the cache folder
+store_entry() {
+  local id="$1" path="$2" dest="$CACHE_DIR/$1"
+  rm -rf "$dest.new" "$dest"; mkdir -p "$dest.new/tree" || return 1
+  rsync -a --exclude=/.git "$ROOT/$path/" "$dest.new/tree/" || return 1
+  jq -n --arg id "$id" --arg k "$3" --arg c "$5" --arg commit "$4" --arg n "$NODE_V" --arg p "$PHP_V" --arg cv "$COMPOSER_V" \
+    --arg r "$(cache_sha256_of "$(cache_recipe_file "$id")")" \
+    '{app: $id, key: $k, checksum: $c, app_commit: $commit, node: $n, php: $p, composer: $cv, recipe_hash: $r}' > "$dest.new/meta.json" || return 1
+  mv "$dest.new" "$dest"
 }
 
 build_app() { # build_app <path>
-  local path="$1" id; id=$(basename "$1")
+  local path="$1" id commit key sum reason; id=$(basename "$1")
   if is_gitlink "$ROOT" "$path"; then
     log "$id: initialising the submodule $path (shallow)"
     git -C "$ROOT" submodule update --init --depth 1 -- "$path" || return 1
@@ -79,6 +71,19 @@ build_app() { # build_app <path>
     warn "$id: $path is empty after initialising"
     return 1
   fi
+  commit=$(git -C "$ROOT" rev-parse "HEAD:$path") || return 1
+  key=$(cache_app_key "$id" "$commit" "$NODE_V" "$PHP_V" "$COMPOSER_V") || return 1
+  if [ "$USE_CACHE" = true ]; then
+    if reason=$(cache_entry_valid "$CACHE_DIR" "$id" "$key" 2>&1); then
+      rsync -a --delete --exclude=/.git "$CACHE_DIR/$id/tree/" "$ROOT/$path/" || return 1
+      log "$id: reused from the cache (key $key)"
+      record_build "$id" "$key" "$(jq -r .checksum "$CACHE_DIR/$id/meta.json")" || return 1
+      reused+=("$id")
+      return 0
+    fi
+    log "$id: not reused: $reason"
+  fi
+  log "$id: building (key $key)"
   if [ -f "$RECIPES_DIR/$id.sh" ]; then
     log "$id: build recipe $RECIPES_DIR/$id.sh"
     ( cd "$ROOT/$path" && APP="$id" bash "$RECIPES_DIR/$id.sh" ) || return 1
@@ -86,9 +91,18 @@ build_app() { # build_app <path>
     log "$id: default recipe"
     ( cd "$ROOT/$path" && APP="$id" default_recipe ) || return 1
   fi
+  sum=$(cache_tree_checksum "$ROOT/$path") || return 1
+  record_build "$id" "$key" "$sum" || return 1
+  built+=("$id")
+  if [ "$USE_CACHE" = true ]; then
+    mkdir -p "$CACHE_DIR" && store_entry "$id" "$path" "$key" "$commit" "$sum" || return 1
+  fi
 }
 
-failed=()
+read -r NODE_V PHP_V COMPOSER_V < <(cache_toolchain) || exit 1
+echo '{}' > "$BUILDS"
+log "toolchain for the cache keys: node $NODE_V, php $PHP_V, composer $COMPOSER_V; cache: $(if [ "$USE_CACHE" = true ]; then echo "$CACHE_DIR"; elif [ -n "$CACHE_DIR" ]; then echo "ignored (no_cache)"; else echo off; fi)"
+failed=(); built=(); reused=(); dropped=()
 while read -r path; do
   [ -n "$path" ] || continue
   if ! build_app "$path"; then
@@ -97,4 +111,34 @@ while read -r path; do
   fi
 done < "$WORK/apps-all.txt"
 [ ${#failed[@]} -eq 0 ] || die "these apps failed to build: ${failed[*]}"
-log "apps built: $(wc -l < "$WORK/apps-all.txt")"
+
+# Entries of the folder that are no pinned app any more are dropped (an app pinned but not part of this run stays).
+if [ "$USE_CACHE" = true ] && [ -d "$CACHE_DIR" ]; then
+  pinned=$(pinned_app_paths "$ROOT" | xargs -r -n1 basename)
+  if [ -n "$pinned" ]; then
+    shopt -s nullglob dotglob
+    for entry in "$CACHE_DIR"/*; do
+      name=$(basename "$entry")
+      grep -qxF -- "$name" <<<"$pinned" && continue
+      log "$name: not a pinned app any more, dropped from the cache"
+      rm -rf -- "$entry"; dropped+=("$name")
+    done
+    shopt -u nullglob dotglob
+  fi
+fi
+
+log "apps: $(wc -l < "$WORK/apps-all.txt") (reused ${#reused[@]}, built ${#built[@]})"
+if [ "$USE_CACHE" = true ] && [ $(( ${#built[@]} + ${#dropped[@]} )) -gt 0 ] && compgen -G "$CACHE_DIR/*/meta.json" >/dev/null; then
+  folder_key=$(cache_folder_key "$CACHE_DIR")
+  log "the cache folder changed (built ${#built[@]}, dropped ${#dropped[@]}): save it as $folder_key"
+  if [ -n "${GITHUB_OUTPUT:-}" ]; then { echo "cache_save=true"; echo "cache_key=$folder_key"; } >> "$GITHUB_OUTPUT"; fi
+else
+  log "the cache folder is not saved ($(if [ "$USE_CACHE" = true ]; then echo "nothing changed"; else echo "cache not used"; fi))"
+fi
+if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+  {
+    echo "### App build cache"
+    echo "Reused ${#reused[@]}, built ${#built[@]}, dropped ${#dropped[@]} (cache $(if [ "$USE_CACHE" = true ]; then echo on; else echo off; fi))."
+    [ ${#built[@]} -eq 0 ] || echo "Built: ${built[*]}"
+  } >> "$GITHUB_STEP_SUMMARY"
+fi

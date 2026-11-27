@@ -16,7 +16,7 @@ accepted only on a snapshot branch, see "Release builds". All flavors of a run s
 still uses a number, so numbers can have gaps; they always increase.
 
 Triggers: `schedule` (05:07 UTC daily) and `workflow_dispatch` with inputs `kind` (default `dev`),
-`flavors` (comma separated, default every folder of `IONOS/flavors`), `force` and `smoke_break` (see the smoke test below). Scheduled and manual
+`flavors` (comma separated, default every folder of `IONOS/flavors`), `force`, `no_cache` (see "Cache" below) and `smoke_break` (see the smoke test below). Scheduled and manual
 runs only exist once the file is on the default branch; a person switches that to the dev branch (a
 separate settings ticket). A dev run must be on `ionos-dev-v<nn>`: the line is derived from the branch name.
 
@@ -46,8 +46,9 @@ no cancelling) runs everything that executes app code and ends by uploading the 
 4. `ionos-build-select.sh`: `ncw resolve` for every flavor; the out-of-tree apps of a flavor are the
    entries of its ACTIVE app folders (read from the commit) whose mode is not `removed`. None is fine.
    It also writes `scope` (`all` when the selected flavors are every flavor of `IONOS/flavors`).
-5. `ionos-build-apps.sh`: initialises only those submodules (depth 1) and builds each from source, by
-   this rule. A script `.github/ionos/build-recipes/<app id>.sh` replaces the default for that app: it is
+4a. `actions/cache/restore` restores the app build cache folder (skipped for `no_cache`), see "Cache" below.
+5. `ionos-build-apps.sh`: initialises only those submodules (depth 1) and builds each from source, unless the cache holds a
+   verified build of it under the same key (see "Cache"), by this rule. A script `.github/ionos/build-recipes/<app id>.sh` replaces the default for that app: it is
    run in the app folder with `APP` set (use `set -euo pipefail`), it owns what it deletes and builds, and
    no check is made on its result. Without a recipe the default recipe applies, and built files are never
    trusted:
@@ -55,13 +56,13 @@ no cancelling) runs everything that executes app code and ends by uploading the 
      naming the app (add a recipe, even a no-op one that states the files are sources);
    - `composer.json` (always, even when it requires only php, extensions or the bin plugin: the app's `composer/autoload.php` requires `vendor/autoload.php`): untracked `vendor/` files are deleted, `composer install --no-dev -a --no-scripts` runs and `vendor/autoload.php`
      must exist, else the step fails naming the app;
-   - `package.json` with a `build` script: `js/` and `css/` are deleted, `npm ci --ignore-scripts && npm run
+   - `package.json` with a `build` script: untracked `js/` and `css/` files are deleted, `npm ci && npm run
      build` runs, and `js/` or `css/` must contain files, else the step fails naming the app (an app that
      builds elsewhere needs a recipe);
    - `node_modules` is deleted afterwards.
-   `--ignore-scripts` is used for the apps because most do not need lifecycle scripts (as for the tool itself); an app
-   that needs a `postinstall` has to use a recipe. The server cannot use it (see 2). An app that keeps
-   handwritten files in `js/` or `css/` also needs a recipe, because the default recipe deletes those dirs.
+   `npm ci` runs lifecycle scripts for the apps (vue-demi's `postinstall` is needed by text, viewer and photos; see the table
+   at the end). Tracked files are never deleted, so handwritten files in `js/` or `css/` survive, but an app with committed
+   `js/` or `css/` and no build script needs a recipe.
 6. `ionos-build-assemble.sh`: a CLEAN tree in `$WORK/tree` (the tool loads it all into memory), done as
    upstream's release build does (`nextcloud-releases/server`, `.github/scripts`): copy without `.git`,
    `node_modules`, `IONOS`; `3rdparty` without `.git .github .gitignore README.md`; remove what the root
@@ -73,10 +74,11 @@ no cancelling) runs everything that executes app code and ends by uploading the 
 7. `ionos-build-package.sh`: per flavor, a pins file `{app: {commit, describe}}` for the flavor's built
    submodule apps (`git submodule status` must show the pinned commit; `describe` is `git describe --tags
    --always` after a blobless unshallow fetch), then `ncw build --kind dev --build-number <run number>
-   --line <nn> --server-commit <HEAD> --flavors-commit <IONOS sha> --app-pins <file>` (no `--cache-keys`:
-   the cache is a later ticket), then `ncw validate --artifact`, then `<zip>.sha256`. A failing flavor
+   --line <nn> --server-commit <HEAD> --flavors-commit <IONOS sha> --app-pins <file> --cache-keys <file>` (the key and
+   checksum of each of the flavor's USED app builds, see "Cache"), then `ncw validate --artifact`, then `<zip>.sha256`. A failing flavor
    leaves no archive; the other flavors still run, all failures are reported at the end and the step fails.
    `$WORK/validated` is written only when every flavor passed.
+7a. `actions/cache/save` (in the file right after step 5; only when `ionos-build-apps.sh` asked for it), see "Cache".
 8. Upload of the artifact (`actions/upload-artifact`), only reached when everything above passed.
 
 **`smoke`** (needs `plan` and `build`; permissions `contents: read` only): see "Fresh-install smoke test" below.
@@ -129,6 +131,8 @@ wizard's ruleset is on, so every rebuild reads the same annotation.
 puts kind, snapshot branch, release number and scope into `version.json` (spec 04). It first checks that the base release of
 the built tree is the one in the tag name. A release build never skips because nothing changed and prunes nothing. The build
 number is the run number, as for dev builds. The smoke job runs unchanged and blocks publishing.
+A release build uses the app build cache like a dev build (a release rebuilt from the same snapshot reuses the same trees); `version.json`
+records the key and checksum of every used app build (`cached_builds`), reused or fresh. `no_cache` makes it fully clean (see "Cache").
 
 **Publish** (`ionos-build-release.sh`, sourced by `ionos-build-publish.sh` when `KIND=release`; the gate before it is the same):
 
@@ -244,6 +248,79 @@ the gate did what it is for. Two real defects were found by reading the install 
   instance works. Decision: groupfolders is `available` plus `enable_after_install: [groupfolders]` in the flavor, and
   `ncw-configure.sh` enables it. This needs the flavors commits that add the field and the script (pin bump).
 
+## Cache
+
+Built apps are kept in the GitHub Actions cache; the server build is not cached (accepted). The key is portable:
+it is a sha256 of facts about the build and nothing about the runner, so moving the cache to JFrog later changes
+no key and no artifact. Code: `ionos-cache-lib.sh` (key, checksum, folder key), `ionos-build-apps.sh` (reuse and
+store), `ionos-cache-check*.sh` (the weekly job).
+
+**Layout.** ONE folder (`$RUNNER_TEMP/ionos-app-cache`), because `actions/cache` takes one key and one path per
+step and the steps of a workflow are static:
+
+```
+<cache>/<app id>/tree         the built app folder without .git (every recipe deletes node_modules)
+<cache>/<app id>/meta.json    key, checksum, app_commit, node, php, composer, recipe_hash
+```
+
+**Per-app key.** `sha256` over a fixed text: the key rules version, the app id, the app's commit (the gitlink of the
+checked-out commit, `git rev-parse HEAD:<path>`), the sha256 of the recipe in effect, the Node version (`node --version`),
+the PHP version (`PHP_VERSION`) and the Composer MAJOR version. The recipe in effect is the file
+`build-recipes/<app id>.sh` when there is one, else `ionos-build-default-recipe.sh` (the default recipe and the
+version of its rules, `RECIPE_RULES_VERSION`; any edit of that file, even a comment, gives every default-recipe app a new key
+once). The npm version is not in the key (it follows Node). A key never contains a run id, a path or a runner name.
+
+**Checksum.** `sha256` over the sorted list of every file of the app tree with the sha256 of its content, plus every
+symbolic link with its target (links are never followed), as paths relative to the app folder. Left out: the top-level
+`.git`, and timestamps, owners, modes and empty folders (they are not content). Nothing else is ignored (see the
+reproducibility measurement below for why no pattern is needed).
+
+**Restore and reuse (`build` job).** `actions/cache/restore` (skipped for `no_cache`) restores the newest folder by the
+prefix `ionos-app-build-v1-` (`restore-keys`; the `key` of the step matches nothing on purpose). `ionos-build-apps.sh` always
+initialises the app's submodule (the assembly and the pins need the git checkout), computes the key, and reuses the app only when
+the cache holds an entry with EXACTLY that key and the tree still has the checksum of its `meta.json`; then the tree is copied over the
+app folder (`rsync --delete`, never `.git`). Everything else is built by the recipe, and the entry is replaced. Reasons for a rebuild are
+logged (`<app>: not reused: ...`: not in the cache, other key, no or unreadable `meta.json`, no tree, a tree that does not match its checksum).
+A restored cache is untrusted input like any build output: it only supplies app trees, which the assembly and the flavors tool's static checks
+then treat like freshly built ones, nothing in it is ever executed, links and odd entries are not followed, and a mismatch means rebuild.
+The checksum detects damage and stale or mixed content; it is not a signature, so what protects the cache is who may write it: only this
+workflow's `build` job (dev branch, snapshot branch, scheduled and manual runs; no pull request), and GitHub scopes a cache to its branch.
+
+**Save.** `ionos-build-apps.sh` writes `cache_save=true` and `cache_key` to the step output when an app was built or an entry dropped
+(an app that is no pinned app of any `apps-*` folder any more; an app that is pinned but not part of this run, for instance with the
+`flavors` input, stays). The step `actions/cache/save` runs only then, under `ionos-app-build-v1-<sha256 of the sorted "<app> <key>" lines>`.
+An already existing key is fine: the action only logs that it could not reserve it, and the step is `continue-on-error`, so a failed save never
+fails a build. A run that reused everything saves nothing. Caches are immutable, so a damaged entry is not repaired by saving under the same
+key: it is rebuilt in every run until an app key changes; delete the cache in the Actions UI to start clean.
+
+**`version.json`.** `ionos-build-apps.sh` writes `$WORK/app-builds.json` (`{"<app>": {"key", "checksum"}}` of every USED build, reused or built
+fresh), and `ionos-build-package.sh` passes each flavor's apps from it as `ncw build --cache-keys <file>`; they end up in `cached_builds`.
+An app of the flavor without a recorded build fails the flavor. Release builds use the cache like dev builds, and say so the same way.
+
+**`no_cache`** (manual runs only, boolean, default false): the restore step is skipped, nothing in the folder is read or reused, every app is built, and
+NOTHING IS SAVED (a clean run must not replace what other runs use; an equal key could not be overwritten anyway). The used keys and checksums are
+still recorded in `cached_builds`. Use it for a fully clean release build or to see whether the cache drifted.
+
+### Reproducibility of the app builds (measured)
+
+Before the weekly comparison was built, all 27 pinned apps (22 of `apps-upstream/`, 5 of `apps-flavor1/`, the pins of commit
+99c442a) were built twice, in new folders, from shallow clones of the pinned commits, with the real `ionos-build-apps.sh`, real npm and
+composer, Node 24.21, PHP 8.3.6, Composer 2.7.1, 4 apps at a time, and the checksum of each tree was compared. Result with the plain checksum
+(every file): 24 of 27 apps identical, 3 different. With the two documented ignore patterns (`CACHE_CHECKSUM_IGNORE` in `ionos-cache-lib.sh`): 26
+identical, 1 different.
+
+| App | What differs between two builds | Handling |
+| --- | --- | --- |
+| app_api | only `js/app_api-adminSettings.js.map` (the `mappings` string); the js is identical | `*.map` is ignored by the checksum (source maps are debugging aids, never loaded by the server) |
+| text | `webpack-stats.json` at the app root (untracked build report, shipped): `builtAt` is the build time, the asset order differs | the root `webpack-stats.json` is ignored by the checksum |
+| calendar | `js/calendar-contacts-menu.js` and `js/calendar-reference.js` (and so their maps): webpack/terser names identifiers differently (`e3` against `e9`) | cannot be normalized: listed in `ionos-cache-check-known.txt`. Measured on 5 builds: 5 different checksums. The weekly job still compares it, but a difference is only reported as "known to differ" and opens no issue |
+| related_resources | no difference, but the build FAILED without a recipe: it commits its built `js/`, webpack does not rewrite an unchanged file, so the default recipe's "the build wrote a new file" check failed | new recipe `build-recipes/related_resources.sh` (deletes the committed built `js/` first, which also drops stale chunk names); 3 builds with it: identical |
+
+Everything else (23 apps) is bit-reproducible, also the apps with `*.map.license` links. Not part of the checksum, because they are not content: timestamps, owners,
+modes and empty folders. A cached app that was built on another day therefore has the same checksum as a rebuild, which is what makes the weekly
+comparison meaningful. One pass takes about 10 minutes at 4 apps in parallel; the built trees together are about 730 MB uncompressed (calendar and
+password_policy about 115 MB each), so the cache folder is large: GitHub evicts a cache after 7 days without a hit, the weekly job keeps it alive.
+
 ## Differences from upstream's release build
 
 - Not signed (no code signing, no GPG), no metadata file, no tar.bz2.
@@ -266,7 +343,8 @@ All 22 apps of `apps-upstream/` and the 5 of `apps-flavor1/` were built from the
 | text, viewer, photos, privacy, files_pdfviewer, recommendations | `npm ci --ignore-scripts` breaks the build (vue-demi's postinstall) | default recipe runs `npm ci` with scripts |
 | password_policy | composer `post-install-cmd` runs `composer bin all install` (dev tooling) and fails | composer runs with `--no-scripts` |
 | calendar, groupfolders, notes, tasks | composer requires only php or the bin plugin; tracked handwritten `css/` | no recipe: composer runs with `--no-scripts` (the autoloader is needed even without packages), tracked files are never deleted |
-| files_downloadlimit, related_resources | tracked `css/public.css` is a build input; related_resources commits its built `js/` | tracked files are never deleted; the rebuild rewrites changed files, which is what the marker check sees |
+| files_downloadlimit | tracked `css/public.css` is a build input | tracked files are never deleted |
+| related_resources | commits its built `js/` (partly stale); a faithful rebuild rewrites nothing, so the default recipe's marker check fails (found by the reproducibility measurement above) | recipe `build-recipes/related_resources.sh` |
 
 `engines` warnings (EBADENGINE, for example Node ^22 in some apps) are warnings only; no app broke on Node 24.
 What a local run cannot show: the runner's PHP is also 8.3, but its Composer version may differ.
@@ -286,5 +364,6 @@ organization's rule against fine-grained tokens with a lifetime over 366 days do
 - `flavor1` takes five apps from the app folder `apps-flavor1/` (submodules, see `ionos-flavor-apps.md`); four of them
   have a recipe in `build-recipes/`. Recipes should use `$NPM` and `$COMPOSER` (set by the tests; unset means the plain commands)
   instead of plain `npm` and `composer`, so the tests can stub them.
-- No cache (own ticket): server and apps are built on every run.
+- The server build is not cached (accepted). The cache of the apps is the Actions cache for now; moving it to JFrog later changes
+  no key and no artifact (see "Cache").
 - The tool loads the whole tree: about 1.5 GB of memory and 35 s per flavor on the official tree.

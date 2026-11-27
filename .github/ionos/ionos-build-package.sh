@@ -4,7 +4,9 @@
 # no archive and no checksum; the other flavors are still built, all failures are reported at the end and
 # the step fails (nothing is published). Only when every flavor passed does it
 # write $WORK/validated (a copy of flavors.txt), which the publish script requires. Needs jq and git.
-# All flavors share BUILD_NUMBER. No cache keys are passed (the cache comes with its own ticket).
+# All flavors share BUILD_NUMBER. Each flavor also gets a cache keys file, the key and checksum of the USED
+# build (reused from the cache or built fresh) of each of its apps, taken from $WORK/app-builds.json that
+# ionos-build-apps.sh wrote; it is given to `ncw build --cache-keys` and ends up in version.json (cached_builds).
 #
 # Environment:
 #   WORK, ROOT (see ionos-build-assemble.sh)
@@ -76,15 +78,30 @@ pins_file() {
   echo "$file"
 }
 
+# keys_file <flavor>: {"<app>": {"key": ..., "checksum": ...}} of every out-of-tree app of the flavor (the apps of
+# apps/<flavor>.txt, submodules or not). An app without a recorded build is an error: the keys must say what was shipped.
+keys_file() {
+  local flavor="$1" file="$WORK/cache-keys-$1.json" ids
+  ids=$(while read -r path; do [ -z "$path" ] || basename "$path"; done < "$WORK/apps/$flavor.txt" | jq -R . | jq -sc .)
+  [ -f "$WORK/app-builds.json" ] || { [ "$ids" = '[]' ] && echo '{}' > "$WORK/app-builds.json"; } \
+    || die "no $WORK/app-builds.json: run ionos-build-apps.sh first"
+  jq --argjson ids "$ids" '
+    . as $all | ($ids | map(select($all[.] == null))) as $missing
+    | if ($missing | length) > 0 then error("no build recorded for: " + ($missing | join(", "))) else
+      ($ids | map({key: ., value: $all[.]}) | from_entries) end' "$WORK/app-builds.json" > "$file" || return 1
+  echo "$file"
+}
+
 # build_flavor <flavor>: build, validate, checksum. Returns 1 on the first problem of this flavor and leaves
 # no archive and no checksum of it behind. Explicit returns: it runs under `if !`, where `set -e` does nothing.
 build_flavor() {
-  local flavor="$1" pins zip
+  local flavor="$1" pins keys zip
   pins=$(pins_file "$flavor") || return 1
+  keys=$(keys_file "$flavor") || { warn "flavor $flavor: the used app builds are not all recorded"; return 1; }
   log "building flavor $flavor (build $BUILD_NUMBER)"
   zip=$("${NCW_CMD[@]}" build --flavors "$FLAVORS_DIR" --flavor "$flavor" --tree "$TREE" --line "$LINE" --kind "$KIND" \
     --build-number "$BUILD_NUMBER" --out "$OUT" --server-commit "$SERVER_COMMIT" --flavors-commit "$FLAVORS_COMMIT" \
-    --app-pins "$pins" "${SNAPSHOT_ARGS[@]}") || { warn "the build of flavor $flavor failed"; return 1; }
+    --app-pins "$pins" --cache-keys "$keys" "${SNAPSHOT_ARGS[@]}") || { warn "the build of flavor $flavor failed"; return 1; }
   [ -f "$zip" ] || { warn "the build of flavor $flavor printed '$zip', which is not a file"; return 1; }
   log "validating $(basename "$zip")"
   if ! "${NCW_CMD[@]}" validate --flavors "$FLAVORS_DIR" --flavor "$flavor" --artifact "$zip"; then

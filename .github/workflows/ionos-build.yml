@@ -14,6 +14,14 @@
 # is derived from the ref and is not an input). Release number, snapshot branch and scope are read from the
 # snapshot's annotated tag by the plan job, never taken from an input.
 #
+# APP BUILD CACHE: built apps are kept in ONE folder of the GitHub Actions cache (see ionos-build.md, "Cache").
+# The restore step uses a key prefix so the newest folder is found; ionos-build-apps.sh reuses an app only
+# when its own key (app commit, recipe, Node, PHP, Composer major) and checksum match and builds the rest;
+# the save step runs only when something was built or dropped. Release builds use the cache too (version.json
+# cached_builds says what was used). Input no_cache: no restore, nothing reused, no save. The cache is only
+# ever filled by this job (dev branch or snapshot branch, manual or scheduled), never by pull requests.
+# The server build is not cached.
+#
 # NOTE: scheduled runs and manual runs only exist once this file is on the repository's DEFAULT
 # branch, which a person switches to the dev branch (a separate settings ticket). Until then nothing
 # here runs on its own.
@@ -36,6 +44,10 @@ on:
         default: ''
       force:
         description: 'Build although nothing changed since the last dev pre-release (scheduled runs skip then)'
+        type: boolean
+        default: false
+      no_cache:
+        description: 'Fully clean build: do not restore, ignore and do not save the app build cache (manual runs only)'
         type: boolean
         default: false
       smoke_break:
@@ -106,7 +118,9 @@ jobs:
       contents: read
     steps:
       - name: Set the work folder
-        run: echo "WORK=$RUNNER_TEMP/ionos-build" >> "$GITHUB_ENV"
+        run: |
+          echo "WORK=$RUNNER_TEMP/ionos-build" >> "$GITHUB_ENV"
+          echo "CACHE_DIR=$RUNNER_TEMP/ionos-app-cache" >> "$GITHUB_ENV"
 
       # the dev branch, or the snapshot branch of a release build
       - name: Check out the branch of the run
@@ -142,8 +156,32 @@ jobs:
           FLAVORS: ${{ inputs.flavors }}
         run: bash .github/ionos/ionos-build-select.sh
 
+      # The newest folder of built apps: the key matches no entry, restore-keys finds the newest one by its
+      # prefix (the portable key prefix of ionos-cache-lib.sh). A miss is fine: everything is built.
+      - name: Restore the app build cache
+        if: inputs.no_cache != true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/ionos-app-cache
+          key: ionos-app-build-v1-restore-only
+          restore-keys: ionos-app-build-v1-
+
       - name: Build the out-of-tree apps from source
+        id: apps
+        env:
+          NO_CACHE: ${{ inputs.no_cache }}
         run: bash .github/ionos/ionos-build-apps.sh
+
+      # Only when an app was built or dropped (cache_save), under the key of the folder, a hash of all per-app
+      # keys: an existing key is fine (the save then only logs a warning), and the cache is never overwritten.
+      # A failed save never fails the build.
+      - name: Save the app build cache
+        if: steps.apps.outputs.cache_save == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/ionos-app-cache
+          key: ${{ steps.apps.outputs.cache_key }}
 
       - name: Assemble the clean tree
         run: bash .github/ionos/ionos-build-assemble.sh

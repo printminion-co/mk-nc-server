@@ -490,7 +490,7 @@ sc_release_package() {
   check "every flavor gets them" test "$(grep -c 'kind=release bn=58 .*sb=rc/ncw-v33-1 rn=1' "$ROOT/z1/ncw.log" | head -1)" = 2
   check "the archives carry the release build number" test -f "$ROOT/z1/work/out/ncw-flavor1-v33.0.9.58.zip.sha256"
   check "validate runs for a release build too" test "$(grep -c '^ncw validate' "$ROOT/z1/ncw.log")" = 2
-  check "no cache keys for a release build either (cache is a later ticket)" test "$(grep -c 'cache-keys' "$ROOT/z1/ncw.log")" = 0
+  check "a release build records the used app builds too (key and checksum of a)" bash -c "jq -e '(.a.key|length==64) and (.a.checksum|length==64)' '$ROOT/z1/ncw.log.keys.flavor1'"
   check "the run is marked validated" test "$(cat "$ROOT/z1/work/validated")" = "$(cat "$ROOT/z1/work/flavors.txt")"
   run_build z1 ionos-build-package.sh BUILD_NUMBER=58 LINE=33 "SERVER_COMMIT=$sha" "FLAVORS_COMMIT=$fsha" KIND=release SNAPSHOT_BRANCH=rc/ncw-v33-1 RELEASE_NR=1 "RELEASE_SCOPE=--kind dev" SNAPSHOT_BASE=33.0.9
   check "a scope that looks like an option is passed as the value of --scope, not parsed as an option" test "$(status z1)" = 0 -a "$(grep -c 'kind=release bn=58 .* scope=--kind dev$' "$ROOT/z1/ncw.log")" -ge 1
@@ -677,6 +677,8 @@ sc_release_publish() {
 cat > "$ROOT/bin/heavy-stub" <<'STUB'
 #!/usr/bin/env bash
 name="$(basename "$0")"
+# the toolchain version probe of the cache key is not a build command: not logged
+[ "$name $1" = "composer-stub --version" ] && { echo "Composer version ${STUB_COMPOSER_VERSION:-2.7.1} 2024-02-09 15:26:28"; exit 0; }
 echo "${PWD#"$CMD_BASE"/}: $name $*" >> "$CMD_LOG"
 case "$name $1 $2" in
   "npm-stub ci "*) mkdir -p node_modules/dep && echo dev > node_modules/dep/index.js ;;
@@ -689,6 +691,16 @@ exit 0
 STUB
 chmod +x "$ROOT/bin/heavy-stub"
 ln -sf heavy-stub "$ROOT/bin/npm-stub"; ln -sf heavy-stub "$ROOT/bin/composer-stub"
+# node and php are only asked for their version (the cache key); the stubs make the versions a test input
+cat > "$ROOT/bin/node" <<'STUB'
+#!/usr/bin/env bash
+echo "${STUB_NODE_VERSION:-v24.1.0}"
+STUB
+cat > "$ROOT/bin/php" <<'STUB'
+#!/usr/bin/env bash
+printf '%s' "${STUB_PHP_VERSION:-8.3.6}"
+STUB
+chmod +x "$ROOT/bin/node" "$ROOT/bin/php"
 
 # the flavors tool: resolve prints $RESOLVE_DIR/<flavor>.yaml, build writes a fake archive, validate
 # fails for the flavor in $VALIDATE_FAIL
@@ -705,6 +717,7 @@ case "$cmd" in
   build)
     [[ ",${BUILD_FAIL:-}," == *",${A[flavor]},"* ]] && { echo "ncw: boom" >&2; exit 2; }
     [ -n "${A[app-pins]:-}" ] && cp "${A[app-pins]}" "$NCW_LOG.pins.${A[flavor]}"
+    [ -n "${A[cache-keys]:-}" ] && cp "${A[cache-keys]}" "$NCW_LOG.keys.${A[flavor]}"
     mkdir -p "${A[out]}"; f="${A[out]}/ncw-${A[flavor]}-v33.0.9.${A[build-number]}.zip"
     echo "zip ${A[flavor]}" > "$f"; echo "$f" ;;
   validate) [[ ",${VALIDATE_FAIL:-}," == *",${A[flavor]},"* ]] && { echo "ncw: invalid" >&2; exit 2; }; exit 0 ;;
@@ -1006,7 +1019,8 @@ sc_package() {
   local expect; expect="$(git -C "$ROOT/k1/repo/apps-x/a" rev-parse HEAD)"
   check "the pins file holds commit and describe of each built app" bash -c "jq -e --arg c '$expect' '.a.commit == \$c and .a.describe == \"v1.0.0\" and (.b.commit|length==40)' '$ROOT/k1/ncw.log.pins.flavor1'"
   check "the pins file has no removed or unbuilt app" test "$(jq -r 'keys|join(",")' "$ROOT/k1/ncw.log.pins.flavor1")" = a,b
-  check "no cache keys are passed" test "$(grep -c 'cache-keys' "$ROOT/k1/ncw.log")" = 0
+  check "the used app builds are passed as --cache-keys: key and checksum of each built app, nothing else" bash -c "jq -e '(keys == [\"a\",\"b\"]) and (.a.key|test(\"^[0-9a-f]{64}\$\")) and (.a.checksum|test(\"^[0-9a-f]{64}\$\")) and (.a|keys == [\"checksum\",\"key\"])' '$ROOT/k1/ncw.log.keys.flavor1'"
+  check "every flavor gets its own apps' keys" test "$(jq -r 'keys|join(",")' "$ROOT/k1/ncw.log.keys.flavor2")" = a,b
   check "the run is marked validated for the publish step" test "$(cat "$ROOT/k1/work/validated")" = "$(cat "$ROOT/k1/work/flavors.txt")"
 
   fork k2
@@ -1015,6 +1029,7 @@ sc_package() {
   run_build k2 ionos-build-package.sh BUILD_NUMBER=7 LINE=33 SERVER_COMMIT=$sha FLAVORS_COMMIT=$fsha
   check "with no out-of-tree apps the pins are an empty object" test "$(jq -c . "$ROOT/k2/ncw.log.pins.flavor1")" = '{}'
   check "package succeeds with none" test "$(status k2)" = 0
+  check "with no out-of-tree apps the cache keys are an empty object" test "$(jq -c . "$ROOT/k2/ncw.log.keys.flavor1")" = '{}'
 
   # a static-check failure stops the run before anything is published
   fork k3
@@ -1056,9 +1071,215 @@ sc_recipes() {
     check "$id: the recipe succeeds and leaves the handwritten js/ and css/ alone" test "$?" = 0 -a "$(cat "$d/js/script.js")" = src -a "$(cat "$d/css/style.css")" = src
     check "$id: the recipe runs no npm and no composer" test ! -s "$ROOT/rc/cmd.log"
   done
+  # related_resources commits its built js/, partly stale; a faithful rebuild may write no new file
+  id=related_resources; d="$ROOT/rc/$id"; rm -rf "$d"; mkdir -p "$d/js" "$d/css" "$d/src"; git init -q "$d"
+  echo '{"scripts":{"build":"x"}}' > "$d/package.json"; echo '{"require":null}' > "$d/composer.json"
+  echo stale > "$d/js/stale-chunk.js"; echo hand > "$d/css/icons.scss"
+  git -C "$d" add -A; git -C "$d" commit -q -m app
+  check "$id has a recipe" test -f "$HERE/build-recipes/$id.sh"
+  : > "$ROOT/rc/cmd.log"
+  ( cd "$d" && env APP="$id" NPM="$ROOT/bin/npm-stub" COMPOSER="$ROOT/bin/composer-stub" CMD_LOG="$ROOT/rc/cmd.log" CMD_BASE="$ROOT/rc" bash "$HERE/build-recipes/$id.sh" ) > "$ROOT/rc/out.log" 2>&1
+  check "$id: the recipe succeeds, the committed built js/ is replaced by what the build writes, the other tracked files stay" test "$?" = 0 -a ! -e "$d/js/stale-chunk.js" -a -f "$d/js/built.js" -a "$(cat "$d/css/icons.scss")" = hand
+  check "$id: composer and npm run in order and node_modules is gone" bash -c "tr '\n' ';' < '$ROOT/rc/cmd.log' | grep -q 'composer-stub install.*npm-stub ci.*npm-stub run build' && test ! -e '$d/node_modules'"
+  ( cd "$d" && env APP="$id" NPM_NOBUILD="$id" NPM="$ROOT/bin/npm-stub" COMPOSER="$ROOT/bin/composer-stub" CMD_LOG="$ROOT/rc/cmd.log" CMD_BASE="$ROOT/rc" bash "$HERE/build-recipes/$id.sh" ) > "$ROOT/rc/out.log" 2>&1
+  check "$id: a build that writes no file at all fails" test "$?" != 0
 }
 
-ALL="plan release_plan retention publish release_publish select apps recipes server assemble package release_package"
+# ---------------------------------------------------------------- app build cache
+# Everything runs the real scripts against stub npm/composer/node/php. The cache folder is $ROOT/<world>/cache.
+cache_run() { # cache_run <world> [VAR=value ...]: ionos-build-apps.sh with the cache folder of that world
+  local n="$1"; shift
+  run_build "$n" ionos-build-apps.sh CACHE_DIR="$ROOT/$n/cache" "$@"
+}
+npm_calls() { grep -c "apps-x/$2: npm-stub ci" "$ROOT/$1/cmd.log" 2>/dev/null || true; }
+meta() { jq -r "$2" "$ROOT/$1/cache/$3/meta.json"; }
+builds() { jq -r "$2" "$ROOT/$1/work/app-builds.json"; }
+# the pinned commit of an app of the world is moved to a new commit of its source repository
+bump_pin() { # bump_pin <world> <app>
+  echo more >> "$ROOT/src/$2/lib/l.php"; git -C "$ROOT/src/$2" commit -qam "bump"
+  git -C "$ROOT/$1/repo" update-index --cacheinfo "160000,$(git -C "$ROOT/src/$2" rev-parse HEAD),apps-x/$2"
+  git -C "$ROOT/$1/repo" commit -q -m "IONOS(x): bump $2"
+}
+need_apps() { local x; for x in "$@"; do [ -d "$ROOT/src/$x" ] || mkapp "$x"; done; }
+sc_cache() {
+  need_apps a b d; fork c1 a b d
+  run_build c1 ionos-build-select.sh FLAVORS=flavor1
+  # flavor1 resolves a, b, d (c removed): apps-x/a, apps-x/b (recipe), apps-x/d (default recipe)
+  local c="$ROOT/c1/cache"
+  cache_run c1
+  check "cold cache: the run succeeds" test "$(status c1)" = 0
+  check "cold cache: every app is built (npm ci for a and d)" test "$(npm_calls c1 a)" = 1 -a "$(npm_calls c1 d)" = 1
+  check "layout: <cache>/<app>/tree and meta.json for every app" test -f "$c/a/meta.json" -a -f "$c/d/tree/js/built.js" -a -f "$c/b/tree/recipe-ran"
+  check "the cached tree has no .git and no node_modules" test ! -e "$c/a/tree/.git" -a ! -e "$c/a/tree/node_modules"
+  check "the cached tree holds the built files and the tracked sources" test -f "$c/a/tree/vendor/autoload.php" -a -f "$c/a/tree/lib/l.php"
+  check "meta.json has key, checksum, app commit, node, php and recipe hash" bash -c "jq -e '(.key|test(\"^[0-9a-f]{64}\$\")) and (.checksum|test(\"^[0-9a-f]{64}\$\")) and (.app_commit|length==40) and .node==\"v24.1.0\" and .php==\"8.3.6\" and (.recipe_hash|length==64)' '$c/a/meta.json'"
+  check "the app commit in meta.json is the pinned submodule commit" test "$(meta c1 .app_commit a)" = "$(git -C "$ROOT/src/a" rev-parse HEAD)"
+  check "app-builds.json holds key and checksum of every used build" test "$(builds c1 'keys|join(",")')" = a,b,d -a "$(builds c1 .a.key)" = "$(meta c1 .key a)" -a "$(builds c1 .a.checksum)" = "$(meta c1 .checksum a)"
+  check "the key is a plain sha256: nothing of the runner in it" bash -c "[[ \"\$(jq -r .a.key '$ROOT/c1/work/app-builds.json')\" =~ ^[0-9a-f]{64}\$ ]]"
+  check "a cold run asks for a save under a key with the portable prefix" bash -c "grep -q '^cache_save=true' '$ROOT/c1/gh_output' && grep -q '^cache_key=ionos-app-build-v1-[0-9a-f]\{64\}\$' '$ROOT/c1/gh_output'"
+  local key1 first; key1="$(output c1 cache_key)"; first="$(cat "$ROOT/c1/work/app-builds.json")"
+
+  : > "$ROOT/c1/cmd.log"
+  cache_run c1
+  check "unchanged inputs: the run succeeds" test "$(status c1)" = 0
+  check "unchanged inputs: npm is not called at all" test ! -s "$ROOT/c1/cmd.log"
+  check "unchanged inputs: the cached tree is put back into the app folder" test -f "$ROOT/c1/repo/apps-x/a/js/built.js" -a -f "$ROOT/c1/repo/apps-x/a/vendor/autoload.php"
+  check "unchanged inputs: the recipe of b was not run again" bash -c "grep -q 'b: reused' '$ROOT/c1/out.log' && grep -q 'd: reused' '$ROOT/c1/out.log'"
+  check "unchanged inputs: the used keys and checksums are the same" test "$(cat "$ROOT/c1/work/app-builds.json")" = "$first"
+  check "unchanged inputs: nothing is saved" bash -c "! grep -q 'cache_save=true' '$ROOT/c1/gh_output'"
+  # a reused tree behaves like a built one: the assembly accepts it
+  run_build c1 ionos-build-assemble.sh
+  check "the assembly works on reused trees" test "$(status c1)" = 0 -a -f "$ROOT/c1/work/tree/apps-x/a/js/built.js"
+
+  # the key follows the app commit
+  bump_pin c1 a
+  : > "$ROOT/c1/cmd.log"
+  cache_run c1
+  check "a new app commit gives a new key for that app" test "$(builds c1 .a.key)" != "$(jq -r .a.key <<<"$first")" -a "$(builds c1 .a.key)" = "$(meta c1 .key a)"
+  check "a new app commit rebuilds only that app" test "$(npm_calls c1 a)" = 1 -a "$(npm_calls c1 d)" = 0
+  check "the other apps keep their key" test "$(builds c1 .d.key)" = "$(jq -r .d.key <<<"$first")"
+  check "the rebuilt app is saved under a new folder key" bash -c "grep -q '^cache_save=true' '$ROOT/c1/gh_output'" 
+  local key2; key2="$(output c1 cache_key)"
+  check "the folder key follows the per-app keys" test -n "$key2" -a "$key2" != "$key1"
+  check "meta.json holds the new app commit" test "$(meta c1 .app_commit a)" = "$(git -C "$ROOT/src/a" rev-parse HEAD)"
+
+  # the key follows the recipe: a recipe file, and the text of the default recipe
+  : > "$ROOT/c1/cmd.log"; local kb kb2; kb="$(builds c1 .b.key)"
+  echo '# changed' >> "$ROOT/c1/repo/.github/ionos/build-recipes/b.sh"
+  cache_run c1
+  kb2="$(builds c1 .b.key)"
+  check "a changed recipe file gives a new key for that app and rebuilds it" test "$kb2" != "$kb" -a "$(grep -c 'b: building' "$ROOT/c1/out.log")" = 1
+  check "a changed recipe does not touch the other apps" test "$(npm_calls c1 a)" = 0 -a "$(npm_calls c1 d)" = 0
+  local kd; kd="$(builds c1 .d.key)"
+  cp "$HERE/ionos-build-default-recipe.sh" "$ROOT/c1/default-recipe.sh"; echo '# changed text' >> "$ROOT/c1/default-recipe.sh"
+  : > "$ROOT/c1/cmd.log"
+  cache_run c1 DEFAULT_RECIPE_FILE="$ROOT/c1/default-recipe.sh"
+  check "a changed text of the default recipe gives new keys for the default-recipe apps" test "$(builds c1 .d.key)" != "$kd" -a "$(npm_calls c1 d)" = 1 -a "$(npm_calls c1 a)" = 1
+  check "but not for an app with its own recipe" test "$(builds c1 .b.key)" = "$kb2" -a "$(grep -c 'b: reused' "$ROOT/c1/out.log")" = 1
+  : > "$ROOT/c1/cmd.log"
+  cache_run c1
+  check "back with the original default recipe the original key is back (a key is content, not a counter)" test "$(builds c1 .d.key)" = "$kd" -a "$(status c1)" = 0
+
+  # toolchain versions
+  local ka; cache_run c1; ka="$(builds c1 .a.key)"
+  : > "$ROOT/c1/cmd.log"
+  cache_run c1 STUB_NODE_VERSION=v22.9.0
+  check "a new Node version gives new keys and rebuilds" test "$(builds c1 .a.key)" != "$ka" -a "$(npm_calls c1 a)" = 1 -a "$(meta c1 .node a)" = v22.9.0
+  cache_run c1 STUB_NODE_VERSION=v22.9.0 STUB_PHP_VERSION=8.4.1
+  check "a new PHP version gives new keys" test "$(builds c1 .a.key)" != "$ka" -a "$(meta c1 .php a)" = 8.4.1
+  local kp; kp="$(builds c1 .a.key)"
+  cache_run c1 STUB_NODE_VERSION=v22.9.0 STUB_PHP_VERSION=8.4.1 STUB_COMPOSER_VERSION=3.0.0
+  check "a new Composer major version gives new keys" test "$(builds c1 .a.key)" != "$kp"
+  local kc; kc="$(builds c1 .a.key)"
+  cache_run c1 STUB_NODE_VERSION=v22.9.0 STUB_PHP_VERSION=8.4.1 STUB_COMPOSER_VERSION=3.4.5
+  check "a new Composer minor version does not" test "$(builds c1 .a.key)" = "$kc" -a "$(grep -c 'a: reused' "$ROOT/c1/out.log")" = 1
+
+  # a tampered tree is rebuilt, and said so
+  cache_run c1
+  echo evil > "$c/a/tree/js/built.js"; echo evil2 > "$c/a/tree/extra.php"
+  : > "$ROOT/c1/cmd.log"
+  cache_run c1
+  check "a cached tree that does not match its checksum is rebuilt" test "$(status c1)" = 0 -a "$(npm_calls c1 a)" = 1
+  check "and the mismatch is logged" grep -q 'a: .*checksum' "$ROOT/c1/out.log"
+  check "nothing of the tampered tree is used" test ! -e "$ROOT/c1/repo/apps-x/a/extra.php" -a "$(cat "$ROOT/c1/repo/apps-x/a/js/built.js")" = built
+  check "the rebuilt app replaces the bad entry and a save is asked for" bash -c "test ! -e '$c/a/tree/extra.php' && test \"\$(cat '$c/a/tree/js/built.js')\" = built && grep -q '^cache_save=true' '$ROOT/c1/gh_output'"
+  echo not json > "$c/d/meta.json"; : > "$ROOT/c1/cmd.log"
+  cache_run c1
+  check "an unreadable meta.json means rebuild" test "$(status c1)" = 0 -a "$(npm_calls c1 d)" = 1
+  rm -rf "$c/d/tree"; : > "$ROOT/c1/cmd.log"
+  cache_run c1
+  check "a missing tree means rebuild" test "$(status c1)" = 0 -a "$(npm_calls c1 d)" = 1
+  rm -rf "$c/a/tree"; ln -s /etc "$c/a/tree"
+  cache_run c1
+  check "a symbolic link in place of the tree is never followed" test "$(status c1)" = 0 -a ! -L "$c/a/tree" -a -f "$c/a/tree/js/built.js"
+  # a link inside a cached tree is data, not followed: the checksum records the target
+  cache_run c1
+  ln -s /etc/passwd "$c/a/tree/link"
+  cache_run c1
+  check "a tree with an added symbolic link does not match its checksum" test ! -e "$c/a/tree/link" -a "$(status c1)" = 0
+
+  # no_cache
+  cache_run c1
+  local before; before="$(cd "$c" && find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum)"
+  : > "$ROOT/c1/cmd.log"
+  cache_run c1 NO_CACHE=true
+  check "no_cache: every app is built although the cache is intact" test "$(status c1)" = 0 -a "$(npm_calls c1 a)" = 1 -a "$(npm_calls c1 d)" = 1
+  check "no_cache: the cache is ignored (nothing reused)" bash -c "! grep -q 'reused from the cache' '$ROOT/c1/out.log'"
+  check "no_cache: no save is asked for" bash -c "! grep -q 'cache_save' '$ROOT/c1/gh_output'"
+  check "no_cache: the cache folder is not changed" test "$(cd "$c" && find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum)" = "$before"
+  check "no_cache: the used keys and checksums are still recorded" test "$(builds c1 '.a.key|length')" = 64 -a "$(builds c1 '.a.checksum|length')" = 64
+  check "no_cache: the key and checksum equal the cached ones (the stubs are deterministic)" test "$(builds c1 .a.checksum)" = "$(meta c1 .checksum a)"
+  fork c2 a; run_build c2 ionos-build-select.sh
+  cache_run c2 NO_CACHE=true
+  check "no_cache on an empty cache folder creates nothing" test "$(status c2)" = 0 -a ! -e "$ROOT/c2/cache"
+
+  # no cache folder at all (a direct run): builds as before, still records the builds
+  fork c3 a; run_build c3 ionos-build-select.sh; run_build c3 ionos-build-apps.sh
+  check "without CACHE_DIR the apps are built and recorded, no save is asked for" test "$(status c3)" = 0 -a "$(jq -r '.a.key|length' "$ROOT/c3/work/app-builds.json")" = 64 -a ! -s "$ROOT/c3/gh_output"
+
+  # save only when something changed; an app that is gone from the pins is dropped, one not selected stays
+  fork c4 a b d; run_build c4 ionos-build-select.sh
+  cache_run c4
+  mkdir -p "$ROOT/c4/cache/gone/tree"; echo x > "$ROOT/c4/cache/gone/tree/x"; echo '{"key":"deadbeef"}' > "$ROOT/c4/cache/gone/meta.json"
+  cache_run c4
+  check "an app that is not pinned any more is dropped from the folder and that asks for a save" bash -c "test ! -e '$ROOT/c4/cache/gone' && grep -q '^cache_save=true' '$ROOT/c4/gh_output'"
+  check "the dropped app does not count in the folder key (the key is that of the three apps)" bash -c ". '$HERE/ionos-cache-lib.sh'; [ \"\$(grep '^cache_key=' '$ROOT/c4/gh_output' | cut -d= -f2)\" = \"\$(cache_folder_key '$ROOT/c4/cache')\" ]"
+  printf 'apps-x/a\n' > "$ROOT/c4/work/apps-all.txt"
+  cache_run c4
+  check "an app that is pinned but not selected in this run stays in the folder" test -f "$ROOT/c4/cache/d/meta.json" -a -f "$ROOT/c4/cache/b/meta.json" -a "$(status c4)" = 0
+  check "and the run with the subset saves nothing" bash -c "! grep -q 'cache_save=true' '$ROOT/c4/gh_output'"
+  check "the subset run records only its apps" test "$(builds c4 'keys|join(",")')" = a
+
+  # an app that fails to build is not cached and fails the step
+  fork c5 a; run_build c5 ionos-build-select.sh
+  cache_run c5 NPM_FAIL=a
+  check "a failed app build fails the step and is not cached, no save" bash -c "test \"\$(cat '$ROOT/c5/status')\" != 0 && test ! -e '$ROOT/c5/cache/a/meta.json' && ! grep -q cache_save '$ROOT/c5/gh_output'"
+
+  # the package step: the keys file is the used builds, the checksum is of the tree that was assembled
+  check "the checksum of a reused app is that of its tree in the app folder" bash -c ". '$HERE/ionos-cache-lib.sh'; [ \"\$(cache_tree_checksum '$ROOT/c1/repo/apps-x/a')\" = \"\$(jq -r .a.checksum '$ROOT/c1/work/app-builds.json')\" ]"
+
+  # the checksum itself
+  local t="$ROOT/ck" sum
+  rm -rf "$t"; mkdir -p "$t/x/y"; echo 1 > "$t/x/y/f"; echo 2 > "$t/g"; ln -s g "$t/l"; mkdir -p "$t/.git"; echo g > "$t/.git/ignored"
+  sum() { bash -c ". '$HERE/ionos-cache-lib.sh'; cache_tree_checksum '$1'"; }
+  sum="$(sum "$t")"
+  check "checksum: a sha256" bash -c "[[ '$sum' =~ ^[0-9a-f]{64}\$ ]]"
+  touch -d '2001-01-01' "$t/x/y/f"; mkdir "$t/empty"
+  check "checksum: not changed by timestamps and empty folders" test "$(sum "$t")" = "$sum"
+  echo changed > "$t/.git/ignored"
+  check "checksum: .git of the app folder is not part of it" test "$(sum "$t")" = "$sum"
+  # the documented ignore list (ionos-cache-lib.sh): source maps and the root webpack-stats.json, measured nondeterministic
+  mkdir -p "$t/js"; echo '{"mappings":"a"}' > "$t/js/main.js.map"; echo '{"builtAt":1}' > "$t/webpack-stats.json"; sum="$(sum "$t")"
+  echo '{"mappings":"b"}' > "$t/js/main.js.map"; echo '{"builtAt":2}' > "$t/webpack-stats.json"
+  check "checksum: source maps (*.map) and the root webpack-stats.json are ignored" test "$(sum "$t")" = "$sum"
+  echo changed > "$t/js/main.js"
+  check "checksum: the js next to a source map is not ignored" test "$(sum "$t")" != "$sum"
+  rm "$t/js/main.js"; mkdir -p "$t/sub"; echo 1 > "$t/sub/webpack-stats.json"
+  check "checksum: only the webpack-stats.json at the root is ignored" test "$(sum "$t")" != "$sum"
+  rm -r "$t/sub"; echo x > "$t/js/main.js.map.license"
+  check "checksum: a *.map.license file is not a source map" test "$(sum "$t")" != "$sum"
+  rm "$t/js/main.js.map.license"
+  check "checksum: back to the same content, the same checksum" test "$(sum "$t")" = "$sum"
+  echo 3 > "$t/g"
+  check "checksum: a changed file changes it" test "$(sum "$t")" != "$sum"
+  echo 2 > "$t/g"; ln -sf x "$t/l"
+  check "checksum: a changed link target changes it" test "$(sum "$t")" != "$sum"
+  ln -sf g "$t/l"; mv "$t/x/y/f" "$t/x/y/f2"
+  check "checksum: a renamed file changes it" test "$(sum "$t")" != "$sum"
+  mv "$t/x/y/f2" "$t/x/y/f"; : > "$t/new file"
+  check "checksum: an added file (also with a space in its name) changes it" test "$(sum "$t")" != "$sum"
+
+  # the workflow: restore, the static steps, the save, no_cache
+  local wf="$HERE/../workflows/ionos-build.yml"
+  check "workflow: input no_cache, a boolean that defaults to false" bash -c "grep -A3 '^      no_cache:' '$wf' | grep -q 'type: boolean' && grep -A4 '^      no_cache:' '$wf' | grep -q 'default: false'"
+  check "workflow: the restore step is skipped for no_cache" bash -c "grep -B2 -A8 'actions/cache/restore@' '$wf' | grep -q 'inputs.no_cache'"
+  check "workflow: the restore uses a key prefix so the newest folder is found" bash -c "grep -A8 'actions/cache/restore@' '$wf' | grep -q 'restore-keys' && grep -A10 'actions/cache/restore@' '$wf' | grep -q 'ionos-app-build-v1-'"
+  check "workflow: the save step takes the key from the apps step and only runs when asked" bash -c "grep -B3 -A6 'actions/cache/save@' '$wf' | grep -q 'steps.apps.outputs.cache_key' && grep -B3 'actions/cache/save@' '$wf' | grep -q \"cache_save == 'true'\""
+  check "workflow: cache actions are pinned by full commit sha" test "$(grep -c 'uses: actions/cache/\(restore\|save\)@[0-9a-f]\{40\} # v' "$wf")" = 2
+  check "workflow: the prefix is the one the script uses" bash -c ". '$HERE/ionos-cache-lib.sh'; [ \"\$CACHE_PREFIX\" = ionos-app-build-v1- ]"
+}
+
+ALL="plan release_plan retention publish release_publish select apps recipes server assemble package release_package cache"
 if [ $# -gt 0 ]; then SELECT=("$@"); else read -r -a SELECT <<< "$ALL"; fi
 for s in "${SELECT[@]}"; do
   echo "scenario: $s"
