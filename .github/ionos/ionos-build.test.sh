@@ -556,7 +556,9 @@ sc_apps() {
   check "an app with committed js/ and no build script is fine with a recipe" test "$(status a10)" = 0
 
   mkapp cx devonly; fork a12 cx; run_build a12 ionos-build-select.sh; run_build a12 ionos-build-apps.sh
-  check "a composer.json that requires only php, extensions and the bin plugin has nothing to install: composer is not run" test "$(status a12)" = 0 -a "$(grep -c 'apps-x/cx: composer' "$ROOT/a12/cmd.log")" = 0
+  check "a composer.json that requires only php, extensions and the bin plugin still runs composer without scripts (the app's composer/autoload.php needs vendor/autoload.php)" test "$(status a12)" = 0 -a "$(grep -c 'apps-x/cx: composer-stub install --no-dev -a --no-scripts' "$ROOT/a12/cmd.log")" = 1 -a -f "$ROOT/a12/repo/apps-x/cx/vendor/autoload.php"
+  fork a13 cx; run_build a13 ionos-build-select.sh; run_build a13 ionos-build-apps.sh COMPOSER_NOBUILD=cx
+  check "a dev-only composer.json whose composer run leaves no vendor/autoload.php fails and names the app" test "$(status a13)" != 0 -a -n "$(grep 'cx.*vendor/autoload.php' "$ROOT/a13/out.log")"
   check "and such an app is still built with npm" test -f "$ROOT/a12/repo/apps-x/cx/js/built.js"
   # every app is tried; ONE error lists all failing apps
   mkapp cg both

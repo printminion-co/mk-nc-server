@@ -52,7 +52,7 @@ no cancelling) runs everything that executes app code and ends by uploading the 
    trusted:
    - committed files in `js/` or `css/`, no `package.json` build script and no recipe: the step FAILS
      naming the app (add a recipe, even a no-op one that states the files are sources);
-   - `composer.json`: `vendor/` is deleted, `composer install --no-dev -a` runs and `vendor/autoload.php`
+   - `composer.json` (always, even when it requires only php, extensions or the bin plugin: the app's `composer/autoload.php` requires `vendor/autoload.php`): untracked `vendor/` files are deleted, `composer install --no-dev -a --no-scripts` runs and `vendor/autoload.php`
      must exist, else the step fails naming the app;
    - `package.json` with a `build` script: `js/` and `css/` are deleted, `npm ci --ignore-scripts && npm run
      build` runs, and `js/` or `css/` must contain files, else the step fails naming the app (an app that
@@ -182,7 +182,7 @@ Run on the published archive `ncw-flavor1-v33.0.9.5.zip` (server commit 9538551)
 the gate does what it is for. Two real defects, both found by reading the install output:
 
 - `calendar` and `contacts` have no `vendor/autoload.php` (their `composer/autoload.php` requires it), because the app
-  build skips composer when `composer.json` has no runtime packages. `occ maintenance:install` dies with "Failed opening
+  build used to skip composer when `composer.json` has no runtime packages (fixed: composer now always runs, see the default recipe). `occ maintenance:install` died with "Failed opening
   required .../vendor/autoload.php". Composer must run for these apps (the autoloader is needed even without packages).
 - `groupfolders` is `default` in flavor1, so `occ maintenance:install` installs it, and its migration needs a service
   that the app registers when it is loaded (`IUserMappingManager`, bound in `Application::register`); the install dies with
@@ -214,7 +214,7 @@ All 22 apps of `apps-upstream/` and the 5 of `apps-flavor1/` were built from the
 | serverinfo, survey_client | handwritten tracked `js/` and `css/`, no `package.json`, no runtime packages | no-op recipe (`build-recipes/<app>.sh`) |
 | text, viewer, photos, privacy, files_pdfviewer, recommendations | `npm ci --ignore-scripts` breaks the build (vue-demi's postinstall) | default recipe runs `npm ci` with scripts |
 | password_policy | composer `post-install-cmd` runs `composer bin all install` (dev tooling) and fails | composer runs with `--no-scripts` |
-| calendar, groupfolders, notes, tasks | composer requires only php or the bin plugin; tracked handwritten `css/` | no recipe any more: composer is skipped without runtime packages, tracked files are never deleted |
+| calendar, groupfolders, notes, tasks | composer requires only php or the bin plugin; tracked handwritten `css/` | no recipe: composer runs with `--no-scripts` (the autoloader is needed even without packages), tracked files are never deleted |
 | files_downloadlimit, related_resources | tracked `css/public.css` is a build input; related_resources commits its built `js/` | tracked files are never deleted; the rebuild rewrites changed files, which is what the marker check sees |
 
 `engines` warnings (EBADENGINE, for example Node ^22 in some apps) are warnings only; no app broke on Node 24.

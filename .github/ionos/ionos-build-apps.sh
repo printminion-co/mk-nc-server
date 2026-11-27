@@ -2,7 +2,8 @@
 # Builds every out-of-tree app of $WORK/apps-all.txt from source. A submodule is initialised shallowly
 # (only these, never all). The recipe is the script .github/ionos/build-recipes/<app id>.sh when it
 # exists (run with the app folder as the current folder and APP set), else the default:
-#   composer install --no-dev -a --no-scripts   when composer.json has runtime packages
+#   composer install --no-dev -a --no-scripts   when there is a composer.json (always: the app's composer/autoload.php
+#                                               requires vendor/autoload.php even when no package is needed)
 #   npm ci && npm run build                     when package.json has a build script (lifecycle scripts run:
 #                                               vue-demi's postinstall is needed by text, viewer, photos)
 # with the checks of default_recipe below: committed built files are deleted first and the build must
@@ -27,9 +28,9 @@ read -r -a COMPOSER_CMD <<<"${COMPOSER:-composer}"
 #  - an app with committed js/ or css/ files, no package.json build script and no recipe is an error: it
 #    cannot be rebuilt from source here (add .github/ionos/build-recipes/<app>.sh, even a no-op one that
 #    says the files are sources);
-#  - composer.json with runtime packages (anything but php, ext-* and bamarni/*): untracked and ignored files
-#    of vendor/ are removed, `composer install --no-dev -a --no-scripts` runs (post-install-cmd is dev tooling)
-#    and vendor/autoload.php must exist;
+#  - composer.json (always, also when it requires only php, ext-* or bamarni/*): untracked and ignored files
+#    of vendor/ are removed, `composer install --no-dev -a --no-scripts` runs (post-install-cmd, for example
+#    `composer bin all install`, is dev tooling) and vendor/autoload.php must exist, else the app fails;
 #  - a package.json build script: untracked and ignored files of js/ and css/ are removed, a marker is
 #    taken, `npm ci && npm run build` runs, and the build must have written at least one
 #    file newer than the marker in js/ or css/ (so a build that writes nothing fails);
@@ -38,10 +39,9 @@ read -r -a COMPOSER_CMD <<<"${COMPOSER:-composer}"
 # Messages are plain lines naming the app; the one ::error:: of the step lists all failing apps.
 default_recipe() {
   local has_composer=false has_build=false marker
-  # like upstream's release build: composer only when there are runtime packages (not php, ext-* or the bin plugin)
-  if [ -f composer.json ] && jq -e '.require // {} | keys | map(select(. != "php" and (startswith("ext-") | not) and (startswith("bamarni/") | not))) | length > 0' composer.json >/dev/null; then
-    has_composer=true
-  fi
+  # composer always runs when there is a composer.json: Nextcloud apps load composer/autoload.php, which requires
+  # ../vendor/autoload.php even when the app needs no package (calendar, contacts); without it the install dies
+  if [ -f composer.json ]; then has_composer=true; fi
   if [ -f package.json ] && jq -e '.scripts.build' package.json >/dev/null; then has_build=true; fi
 
   if [ "$has_build" = false ] && [ -n "$(git ls-files -- js css | head -n1)" ]; then
