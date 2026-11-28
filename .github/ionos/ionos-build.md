@@ -356,9 +356,10 @@ on the instance is judged like on a fresh install, and an app the flavor does no
 
 - SQLite for every build (dev and release).
 - MariaDB for release builds (`kind == release`), as a job `services:` container. The image is set in ONE place, the `image:` line of the job
-  `upgrade-smoke-mariadb` in `ionos-build.yml`: `mariadb:10.11.19@sha256:e5fe75b2...` (pinned by digest, a multi-arch index). It can be overridden without a commit by
-  the repository variable `IONOS_MARIADB_IMAGE`. Why 10.11: the Nextcloud admin manual lists MariaDB 10.11 / 11.4 / 11.8 / 12.3, and 10.11 is the oldest
-  long-term-support line, so it tests the lower end. The version the user runs in production is NOT known; set the variable (or the line) to it as soon as it is.
+  `upgrade-smoke-mariadb` in `ionos-build.yml`: `mariadb:11.4.8@sha256:bc474f00...` (pinned by digest, a multi-arch index). It can be overridden without a commit by
+  the repository variable `IONOS_MARIADB_IMAGE`. Why 11.4.8: it is the version production runs (confirmed by the owner); the Nextcloud admin manual lists
+  MariaDB 10.11 / 11.4 / 11.8 / 12.3. The first versions of this job ran 10.11.19, the oldest long-term-support line; to test the lower end set the
+  variable to it. When production changes its MariaDB version, change the line here to the same version.
 - The container cannot take server arguments, so the script sets READ-COMMITTED globally with the root account (required by the admin manual): `transaction_isolation`
   first, and on error 1193 (unknown system variable) `tx_isolation`, because MariaDB 10.x only knows the old name and 11.1+ the new one; any other error fails with the
   server's message. Verified against the real images locally (docker): 10.11.19 rejects `transaction_isolation` and accepts `tx_isolation`; 11.8 accepts both.

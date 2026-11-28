@@ -368,10 +368,10 @@ jobs:
       SMOKE_DB: mariadb
     services:
       # THE MariaDB version of the release upgrade test, in one place: change the tag and digest here, or set the
-      # repository variable IONOS_MARIADB_IMAGE to try another one without a commit. 10.11 is the oldest LTS that
-      # Nextcloud 33 supports (10.11 / 11.4 / 11.8 / 12.3); the real production version is not known, see ionos-build.md.
+      # repository variable IONOS_MARIADB_IMAGE to try another one without a commit. 11.4.8 is the version production
+      # runs (Nextcloud 33 supports 10.11 / 11.4 / 11.8 / 12.3), see ionos-build.md.
       mariadb:
-        image: ${{ vars.IONOS_MARIADB_IMAGE || 'mariadb:10.11.19@sha256:e5fe75b2b9de0eb9f6f9a4d9c97272fb3a7480e389ccd487a786bab2a12cc0d7' }}
+        image: ${{ vars.IONOS_MARIADB_IMAGE || 'mariadb:11.4.8@sha256:bc474f00629f0123c10f9e1bca193a45d18af15a274cf0656acda64f1086c3b6' }}
         env:
           MARIADB_ROOT_PASSWORD: smoke-root-password
           MARIADB_DATABASE: ncw_smoke
