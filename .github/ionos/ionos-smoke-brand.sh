@@ -31,9 +31,16 @@
 #      URLs: the favicon, touch icon, mask icon, web manifest and og:image links of the login page, the --image-logo
 #      and --image-logoheader variables of the stylesheet of the enforced theme (they make the logo of the login page
 #      and of the header), and the logo of the sample mail
+#    - the unpacked archive has the source-offer template of the theme (themes/<theme>/apps/settings/templates/settings/
+#      personal/development.notice.php, <theme> = the system setting `theme`): the personal page must link the source of
+#      the running version EXACTLY ONCE, and none of the upstream marketing links of the stock notice (the five social
+#      links, the "reasons" PDF). The expected link comes from version.json of the unpacked archive, by the rule of the
+#      template: kind release -> <repository>/tree/ncw-v<base_release>-<release_number>, kind dev -> <repository>/tree/
+#      <server_commit>, anything else (no file, no JSON, a value that is not strict) -> the plain repository
 # Every probe runs; each prints "ok - <name>" or an ::error:: line "FAIL - <name>: <why>"; the exit status is 1 when
 # one failed or the brand check found a text.
 # Environment: SMOKE_ADMIN_USER, SMOKE_ADMIN_PASS, PHP (default php), SMOKE_BRAND_ALLOWLIST (default: the file next to this script).
+# SMOKE_SOURCE_REPO (the public repository the source link points to, default: this fork, https://github.com/printminion-co/mk-nc-server).
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -43,6 +50,7 @@ export LOG_PREFIX=ionos-smoke-brand
 
 PHP=${PHP:-php}
 ALLOWLIST=${SMOKE_BRAND_ALLOWLIST:-$HERE/ionos-smoke-brand-allowlist.txt}
+SOURCE_REPO=${SMOKE_SOURCE_REPO:-https://github.com/printminion-co/mk-nc-server}
 failed=0
 
 pass() { echo "ok - $1"; }
@@ -267,6 +275,42 @@ if [ -n "$mail_class" ]; then
     if [ "$got" = "$mail_class" ]; then pass "system mail uses the template $mail_class"
     else miss "mail template" "the sample mail was made by '$got', mail_template_class is '$mail_class'"; fi
   else miss "mail template" "no sample mail to check"; fi
+fi
+
+# ---- the source link probe
+# expected_source_url <tree>: the link the notice must show, by the rule of the template: kind release -> the tag
+# ncw-v<base_release>-<release_number>, kind dev -> server_commit; the plain repository when version.json is missing or a
+# value does not match the strict pattern (tag ^[A-Za-z0-9._-]+$, sha ^[0-9a-f]{40}$)
+expected_source_url() {
+  local file=$1/version.json kind="" ref=""
+  if [ -f "$file" ]; then
+    read -r kind ref < <(jq -r 'if type != "object" then empty
+      elif .kind == "dev" then (if (.server_commit | type) == "string" then "dev \(.server_commit)" else empty end)
+      elif .kind == "release" then (if (.base_release | type) == "string" and (.release_number | type) == "number" and .release_number >= 1 and .release_number == (.release_number | floor)
+                                    then "release ncw-v\(.base_release)-\(.release_number)" else empty end)
+      else empty end' "$file" 2>/dev/null | head -n1) || true
+    case "$kind" in
+      dev) [[ $ref =~ ^[0-9a-f]{40}$ ]] || ref="" ;;
+      release) [[ $ref =~ ^[A-Za-z0-9._-]+$ ]] || ref="" ;;
+      *) ref="" ;;
+    esac
+  fi
+  if [ -n "$ref" ]; then echo "$SOURCE_REPO/tree/$ref"; else echo "$SOURCE_REPO"; fi
+}
+
+# the links of the stock development notice that are upstream marketing: none may be on the personal page
+SOURCE_MARKETING_RE='facebook\.com/Nextclouders|bsky\.app/profile/nextcloud|mastodon\.xyz/@nextcloud|nextcloud\.com/blog|newsletter\.nextcloud\.com|id="open-reasons-use-nextcloud-pdf"'
+
+if [ -n "$theme_dir" ] && [[ $theme_dir =~ ^[A-Za-z0-9_-]+$ ]] && [ -f "$TREE/themes/$theme_dir/apps/settings/templates/settings/personal/development.notice.php" ]; then
+  if [ -f "$PAGES/personal.html" ]; then
+    want=$(expected_source_url "$TREE")
+    n=$(grep -oF "href=\"$want\"" "$PAGES/personal.html" | wc -l)
+    others=$(grep -oE "href=\"${SOURCE_REPO}[^\"]*\"" "$PAGES/personal.html" | sort -u | tr '\n' ' ' || true)
+    marketing=$(grep -oE "$SOURCE_MARKETING_RE" "$PAGES/personal.html" | sort -u | tr '\n' ' ' || true)
+    if [ "$n" != 1 ]; then miss "source link" "the personal page has $n link(s) to $want (the source of the running version, from version.json of the archive), wanted exactly 1; links to the repository found: ${others:-none}"
+    elif [ -n "$marketing" ]; then miss "source link" "the personal page still holds upstream marketing links of the stock notice: $marketing"
+    else pass "source link: the personal page links $want exactly once and no upstream marketing"; fi
+  else miss "source link" "no personal page to check"; fi
 fi
 
 # ---- the logo and icon probes

@@ -327,6 +327,7 @@ EOF2
 }
 
 # ---------------------------------------------------------------- scenario: brand_run (fetch, theme probes and the mail against the mock)
+SRC_REPO=https://github.com/printminion-co/mk-nc-server
 brand_world() { # brand_world <name> [theme]: a tree, a resolved flavor and a stub php; sets BW
   BW="$ROOT/$1"; rm -rf "$BW"; mkdir -p "$BW/tree" "$BW/bin" "$BW/sysconf"
   write_mock
@@ -344,6 +345,10 @@ brand_world() { # brand_world <name> [theme]: a tree, a resolved flavor and a st
       echo "theme $f" > "$BW/tree/themes/$2/core/img/$f"; echo "default $f" > "$BW/tree/core/img/$f"
     done
     echo '[{"app":"theming","key":"disable-user-theming","value":"1","type":"boolean"}]' > "$BW/tree/app-config-special.json"
+    # the source-offer template of the theme and the version.json of the archive (a dev build)
+    mkdir -p "$BW/tree/themes/$2/apps/settings/templates/settings/personal"
+    echo '<?php // the source offer' > "$BW/tree/themes/$2/apps/settings/templates/settings/personal/development.notice.php"
+    echo '{"kind":"dev","base_release":"33.0.9","server_commit":"a7505dc9f871b335102ddb5770604c8e2860b919"}' > "$BW/tree/version.json"
   fi
   cat > "$BW/bin/php" <<'STUB'
 #!/usr/bin/env bash
@@ -357,7 +362,7 @@ STUB
 }
 brand_run() { # brand_run <name> [VAR=value ...]: mock + brand script; the log is <name>.log
   local n=$1; shift
-  mock_start MOCK_TREE="$BW/tree" "$@"
+  mock_start MOCK_TREE="$BW/tree" MOCK_SOURCE_LINK="$SRC_REPO/tree/a7505dc9f871b335102ddb5770604c8e2860b919" "$@"
   run "$n" env PATH="$BW/bin:$PATH" PHP="$BW/bin/php" STUB_DIR="$BW" SMOKE_ADMIN_USER=admin SMOKE_ADMIN_PASS=Smoke-Pass SMOKE_BRAND_ALLOWLIST="$FIX/brand-allow.txt" \
     bash "$HERE/ionos-smoke-brand.sh" "$MOCK_URL" "$BW/tree" "$BW/resolved.yaml" "$BW/out"
 }
@@ -430,6 +435,39 @@ STUB
   check "a web root in front of the theme path is fine" bash -c "test '$(status d19)' = 0 && grep -q 'ok - login favicon' '$ROOT/d19.log'"
   brand_world bw20 ionos; rm -rf "$BW/tree/themes/ionos/core"; mkdir -p "$BW/tree/themes/ionos/css"; brand_run d20 MOCK_THEME=ionos
   check "a theme folder without images is not probed for logos" bash -c "test '$(status d20)' = 0 && ! grep -q 'theme folder' '$ROOT/d20.log'"
+  # the source link probe (version.json of the unpacked archive decides the expected link)
+  check "the source link probe passes for a dev archive: the link to the commit of version.json" bash -c "grep -q 'ok - source link: the personal page links $SRC_REPO/tree/a7505dc9f871b335102ddb5770604c8e2860b919 exactly once and no upstream marketing' '$ROOT/d2.log'"
+  brand_world bw21 ionos; echo '{"kind":"release","base_release":"33.0.9","release_number":12}' > "$BW/tree/version.json"
+  brand_run d21 MOCK_THEME=ionos MOCK_SOURCE_LINK="$SRC_REPO/tree/ncw-v33.0.9-12"
+  check "a release archive: the link to the tag ncw-v<base release>-<release number> passes" bash -c "test '$(status d21)' = 0 && grep -q 'ok - source link: .*/tree/ncw-v33.0.9-12 exactly once' '$ROOT/d21.log'"
+  brand_run d21 MOCK_THEME=ionos
+  check "a release archive whose page links the commit fails" bash -c "test '$(status d21)' != 0 && grep -q 'FAIL - source link: the personal page has 0 link(s) to $SRC_REPO/tree/ncw-v33.0.9-12' '$ROOT/d21.log'"
+  check "the failure names the repository links that are there" bash -c "grep -q 'links to the repository found: href=\"$SRC_REPO/tree/a7505dc9f871b335102ddb5770604c8e2860b919\"' '$ROOT/d21.log'"
+  brand_world bw22 ionos; brand_run d22 MOCK_THEME=ionos MOCK_SOURCE_LINK=
+  check "a personal page without the source link fails" bash -c "test '$(status d22)' != 0 && grep -q 'FAIL - source link: the personal page has 0 link(s) to $SRC_REPO/tree/a7505dc9f871b335102ddb5770604c8e2860b919 .*links to the repository found: none' '$ROOT/d22.log'"
+  brand_world bw23 ionos; brand_run d23 MOCK_THEME=ionos MOCK_SOURCE_EXTRA="<a href=\"$SRC_REPO/tree/a7505dc9f871b335102ddb5770604c8e2860b919\">again</a>"
+  check "the source link twice fails (exactly once)" bash -c "test '$(status d23)' != 0 && grep -q 'FAIL - source link: the personal page has 2 link(s)' '$ROOT/d23.log'"
+  brand_world bw24 ionos; brand_run d24 MOCK_THEME=ionos MOCK_SOURCE_LINK="$SRC_REPO/tree/0000000000000000000000000000000000000000"
+  check "a link to another commit fails" bash -c "test '$(status d24)' != 0 && grep -q 'FAIL - source link' '$ROOT/d24.log'"
+  local m
+  for m in 'https://www.facebook.com/Nextclouders/' 'https://bsky.app/profile/nextcloud.bsky.social' 'https://mastodon.xyz/@nextcloud' 'https://nextcloud.com/blog/' 'https://newsletter.nextcloud.com/?p=subscribe' ; do
+    brand_world bw25 ionos; brand_run d25 MOCK_THEME=ionos MOCK_SOURCE_EXTRA="<a href=\"$m\">x</a>"
+    check "an upstream marketing link of the stock notice fails the source link probe ($m)" bash -c "test '$(status d25)' != 0 && grep -q 'FAIL - source link: the personal page still holds upstream marketing links' '$ROOT/d25.log'"
+  done
+  brand_world bw26 ionos; brand_run d26 MOCK_THEME=ionos MOCK_SOURCE_EXTRA='<a id="open-reasons-use-nextcloud-pdf" href="/x">x</a>'
+  check "the reasons PDF link of the stock notice fails the source link probe" bash -c "test '$(status d26)' != 0 && grep -q 'FAIL - source link: the personal page still holds upstream marketing links' '$ROOT/d26.log'"
+  # no version.json, invalid JSON or values that are not strict: the plain repository, by the rule of the template
+  local vj
+  for vj in 'none' '{"kind":"dev",' '{"kind":"dev","server_commit":"a7505dc"}' '{"kind":"dev","server_commit":"A7505DC9F871B335102DDB5770604C8E2860B919"}' '{"kind":"release","base_release":"33.0.9"}' '{"kind":"release","base_release":"33/../1","release_number":3}' '{"kind":"release","base_release":"33.0.9","release_number":"3"}' '{"kind":"release","base_release":"33.0.9","release_number":0}' '{"kind":"nightly","server_commit":"a7505dc9f871b335102ddb5770604c8e2860b919"}' '[1]'; do
+    brand_world bw27 ionos
+    if [ "$vj" = none ]; then rm -f "$BW/tree/version.json"; else printf 'a7505dc9f871b335102ddb5770604c8e2860b919\n' "$vj" > "$BW/tree/version.json"; fi
+    brand_run d27 MOCK_THEME=ionos MOCK_SOURCE_LINK="$SRC_REPO"
+    check "version.json '$vj': the plain repository is expected" bash -c "test '$(status d27)' = 0 && grep -q 'ok - source link: the personal page links $SRC_REPO exactly once' '$ROOT/d27.log'"
+  done
+  brand_world bw28 ionos; rm -rf "$BW/tree/themes/ionos/apps"; brand_run d28 MOCK_THEME=ionos MOCK_SOURCE_LINK=
+  check "an archive without the notice template of the theme does not run the source link probe" bash -c "test '$(status d28)' = 0 && ! grep -q 'source link' '$ROOT/d28.log'"
+  brand_world bw29 ionos; SMOKE_SOURCE_REPO=https://example.invalid/other brand_run d29 MOCK_THEME=ionos MOCK_SOURCE_LINK=https://example.invalid/other/tree/a7505dc9f871b335102ddb5770604c8e2860b919
+  check "SMOKE_SOURCE_REPO sets the repository of the expected link" bash -c "grep -q 'ok - source link: the personal page links https://example.invalid/other/tree/a7505dc9f871b335102ddb5770604c8e2860b919' '$ROOT/d29.log'"
   brand_world bw13; brand_run d13 MOCK_FAIL=settings
   check "a page that does not answer fails the run" bash -c "test '$(status d13)' != 0 && grep -q 'FAIL - page settings' '$ROOT/d13.log'"
   mock_stop
@@ -661,6 +699,25 @@ sc_break_upgrade() {
   check "the brand break is for the fresh-install test only" said k6 "brand none"
   run k7 bash "$HERE/ionos-smoke-break.sh" bogus "$z"
   check "an unknown mode still fails" test "$(status k7)" != 0
+  # source-link: both smoke tests, the notice template of the theme loses its link
+  local tpl=themes/ionos/apps/settings/templates/settings/personal/development.notice.php
+  mkdir -p "$d/$(dirname "$tpl")"; printf '<?php $u = 1; ?>\n<a href="<?php p($u); ?>">the source</a>\n' > "$d/$tpl"
+  rm -f "$z"; ( cd "$d" && zip -qr "$z" . ); cp "$z" "$ROOT/bu-orig.zip"
+  run k8 bash "$HERE/ionos-smoke-break.sh" source-link "$z"
+  check "source-link succeeds and names the template" bash -c "test '$(status k8)' = 0 && grep -q 'themes/ionos/apps/settings/templates/settings/personal/development.notice.php' '$ROOT/k8.log'"
+  check "source-link drops the link from the template" bash -c "unzip -p '$z' '$tpl' | grep -q 'ionos-smoke-break' && ! unzip -p '$z' '$tpl' | grep -q '<a '"
+  check "source-link keeps every other file" bash -c "unzip -Z1 '$z' | grep -qx 'version.php' && unzip -Z1 '$z' | grep -qx 'removed-apps.json' && test \$(unzip -Z1 '$z' | wc -l) = \$(unzip -Z1 '$ROOT/bu-orig.zip' | wc -l)"
+  local job
+  for job in fresh upgrade; do
+    rm -f "$z"; cp "$ROOT/bu-orig.zip" "$z"
+    run k9 env SMOKE_BREAK_JOB=$job bash "$HERE/ionos-smoke-break.sh" source-link "$z"
+    check "source-link tampers with the archives of the $job job" bash -c "test '$(status k9)' = 0 && unzip -p '$z' '$tpl' | grep -q 'ionos-smoke-break'"
+  done
+  run k6 bash -c ". '$HERE/ionos-lib.sh'; . '$HERE/ionos-smoke-lib.sh'; echo \"\$(smoke_break_for fresh source-link) \$(smoke_break_for upgrade source-link)\""
+  check "the source-link break is for both smoke tests" said k6 "source-link source-link"
+  rm -f "$z"; ( cd "$ROOT/zipu" && zip -qr "$z" . -x 'themes/*' )
+  run k10 bash "$HERE/ionos-smoke-break.sh" source-link "$z"
+  check "source-link fails clearly when the archive has no notice template" bash -c "test '$(status k10)' != 0 && grep -q 'no theme template' '$ROOT/k10.log'"
 }
 
 # ---------------------------------------------------------------- scenario: the vanilla download and its checks
@@ -965,7 +1022,7 @@ sc_gate() {
   check "workflow: both upgrade jobs keep their logs with if: always()" test "$(awk '/^  upgrade-smoke-sqlite:$/,/^  gate:$/' "$wf" | grep -c -A1 'if: always()')" -ge 2
   check "workflow: only GitHub-owned actions, all pinned by a full commit sha" bash -c "! grep -E '^ +uses:' '$wf' | grep -vE 'uses: actions/[a-z/-]+@[0-9a-f]{40} # v'"
   check "workflow: the MariaDB image is pinned by digest, in one place, with a repository variable override" bash -c "test \$(grep -c 'mariadb:[0-9.]*@sha256:[0-9a-f]\{64\}' '$wf') = 1 && grep -q 'vars.IONOS_MARIADB_IMAGE' '$wf'"
-  check "workflow: smoke_break lists the upgrade modes" bash -c "grep -q 'options: \[none, missing-app, extra-app, wrong-mode, skip-enable, brand, removed-in-shipped, no-buildnumber\]' '$wf'"
+  check "workflow: smoke_break lists the upgrade modes" bash -c "grep -q 'options: \[none, missing-app, extra-app, wrong-mode, skip-enable, brand, source-link, removed-in-shipped, no-buildnumber\]' '$wf'"
   check "workflow: no expression inside any run block" bash -c "! awk '/^ +run: \\|\$/ {f=1; next} /^ +run: / {print; next} f && /^      [^ ]/ {f=0} f {print}' '$wf' | grep -q '\${{'"
 }
 
@@ -1041,6 +1098,11 @@ if ($uri === '/status.php') {
     if ($key === 'user-theming') {
         $listed = getenv('MOCK_THEMES') ?: ($theme !== '' ? json_encode([['id' => $theme]]) : '[]');
         $extra = $state('theming-themes', $listed) . $state('theming-isUserThemingDisabled', getenv('MOCK_USER_THEMING') === 'on' ? 'false' : 'true');
+    }
+    if ($key === 'personal') {
+        // the development notice of the theme: the link to the source, and what a stock notice would add
+        $link = getenv('MOCK_SOURCE_LINK') ?: '';
+        $extra = ($link === '' ? '' : '<a href="' . $link . '" id="ncw-source-link">source</a>') . (getenv('MOCK_SOURCE_EXTRA') ?: '');
     }
     if ($key === 'admin-theming') { $extra = $state('theming-adminThemingInfo', json_encode(['isThemeable' => getenv('MOCK_ADMIN_THEMEABLE') === '1'])); }
     $page($key, $extra);

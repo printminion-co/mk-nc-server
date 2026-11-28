@@ -35,12 +35,7 @@ user-theming :: Fluid \(Jo Myoung Hee - Nextcloud GmbH, CC-BY-SA-4\.0\) :: image
 user-theming :: Globe \(Jenna Kim - Nextcloud GmbH, CC-BY-SA-4\.0\) :: image attribution required by the license (CC-BY-SA) of a shipped background; the user theming controls are disabled
 user-theming :: "attribution_url":"https://nextcloud\.com/trademarks/" :: link of the image attributions above
 
-# ---- the development notice of the personal settings (template apps/settings/templates/settings/personal/development.notice.php)
-# The AGPL attribution stays; the social links are upstream marketing that the source-link override of the notice
-# (a theme template, 06-branding.md "Source offer") removes: take these entries out with it.
-personal :: <a href="https://nextcloud\.com/contribute" target="_blank" rel="noreferrer noopener">Nextcloud community</a>, the <a href="https://github\.com/nextcloud" target="_blank" rel="noreferrer noopener">source code</a> :: the AGPL attribution and source link of the development notice
-personal :: href="https://www\.facebook\.com/Nextclouders/" :: residual: social link of the development notice, to be removed by the source-link override
-personal :: href="https://bsky\.app/profile/nextcloud\.bsky\.social" :: residual: social link of the development notice, to be removed by the source-link override
-personal :: href="https://mastodon\.xyz/@nextcloud" :: residual: social link of the development notice, to be removed by the source-link override
-personal :: href="https://nextcloud\.com/blog/" :: residual: link of the development notice, to be removed by the source-link override
-personal :: href="https://newsletter\.nextcloud\.com/\?p=subscribe&amp;id=1" :: residual: link of the development notice, to be removed by the source-link override
+# ---- the development notice of the personal settings (theme template, 06-branding.md "Source offer")
+# The theme overrides apps/settings/templates/settings/personal/development.notice.php: the marketing PDF and the five
+# social links of the stock notice are gone, the AGPL attribution sentence stays (English; the page of the smoke tests is English).
+personal :: This server is based on the Nextcloud server by the Nextcloud community and has been modified\. :: the AGPL attribution of the source offer (development notice of the theme)

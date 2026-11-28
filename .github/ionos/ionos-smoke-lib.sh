@@ -114,10 +114,12 @@ smoke_log_check() {
 # The modes of smoke_break (ionos-smoke-break.sh) and the smoke test each one is meant to make fail.
 SMOKE_BREAK_FRESH_MODES="missing-app extra-app wrong-mode skip-enable brand"
 SMOKE_BREAK_UPGRADE_MODES="removed-in-shipped no-buildnumber"
+# modes that break both smoke tests, because both run the same brand check and theme probes
+SMOKE_BREAK_BOTH_MODES="source-link"
 # smoke_break_for <job: fresh|upgrade> <mode>: the mode when it is meant for this job, none otherwise (a mode never
 # touches the archives of a job it is not meant for, so that exactly the job that names it must fail)
 smoke_break_for() {
   local m
-  case "$1" in fresh) m=$SMOKE_BREAK_FRESH_MODES ;; upgrade) m=$SMOKE_BREAK_UPGRADE_MODES ;; *) echo none; return 1 ;; esac
+  case "$1" in fresh) m="$SMOKE_BREAK_FRESH_MODES $SMOKE_BREAK_BOTH_MODES" ;; upgrade) m="$SMOKE_BREAK_UPGRADE_MODES $SMOKE_BREAK_BOTH_MODES" ;; *) echo none; return 1 ;; esac
   case " $m " in *" $2 "*) echo "$2" ;; *) echo none ;; esac
 }

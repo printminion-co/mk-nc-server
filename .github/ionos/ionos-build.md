@@ -237,6 +237,24 @@ shipped list was written from the real pages of the dev build (see "What the bra
 | system setting `theme` is set (the legacy theme folder) | the admin theming section says `isThemeable` is false (admin controls gone: the theming app shows "already using a custom theme" instead of its settings) |
 | system setting `mail_template_class` is set | the sample mail was made by exactly that class |
 | the unpacked archive has images in `themes/<theme>/core/img/` (`<theme>` = the system setting `theme`) | the logo and icon URLs the instance hands out point into that folder, answer 200 and are byte-identical (sha256) to the archive's file, and are not a copy of the Nextcloud default of the same name (see "Logo probes") |
+| the unpacked archive has the source-offer template `themes/<theme>/apps/settings/templates/settings/personal/development.notice.php` | the personal page has a link to the source of the running version EXACTLY ONCE and none of the upstream marketing links of the stock notice (see "Source link probe") |
+
+**Source link probe.** The AGPL source offer is the development notice of the personal settings, overridden by the theme template (06-branding.md,
+"Source offer"; the template is `themes/ionos/apps/settings/templates/settings/personal/development.notice.php` of the flavors repo). The probe reads
+`version.json` of the UNPACKED ARCHIVE under test by the same rule as the template and expects this link on the personal page (the repository is
+`SMOKE_SOURCE_REPO`, default `https://github.com/printminion-co/mk-nc-server`):
+
+| `version.json` | expected link |
+| --- | --- |
+| `kind` `release`, `base_release`, `release_number` (an integer >= 1) | `<repository>/tree/ncw-v<base_release>-<release_number>` (the annotated snapshot tag; the tag must match `^[A-Za-z0-9._-]+$`) |
+| `kind` `dev`, `server_commit` (`^[0-9a-f]{40}$`) | `<repository>/tree/<server_commit>` |
+| missing, not JSON, another kind or a value that is not strict | `<repository>` |
+
+The link must be on the page exactly once, and the page must not hold the stock marketing links (facebook, bluesky, mastodon, blog, newsletter, the
+"reasons" PDF button). Failures: `FAIL - source link: the personal page has 0 link(s) to <url> ..., wanted exactly 1; links to the repository found: ...`
+and `FAIL - source link: the personal page still holds upstream marketing links ...`. It runs in the fresh-install and both upgrade smoke tests, for dev
+and release archives, because they share `smoke_checks`. The AGPL attribution sentence ("This server is based on the Nextcloud server by the Nextcloud
+community and has been modified.") is the one allow-list entry for the notice; the five social entries and the old attribution entry are gone.
 
 **Logo probes.** Each URL is taken from what the instance really sends, not built by the script, so a link that falls back to the Nextcloud default
 fails: the `icon`, `apple-touch-icon`, `mask-icon` and `manifest` links and the `og:image` meta of the login page; the `--image-logo` and
@@ -275,6 +293,7 @@ A manual run of `IONOS build` with input `smoke_break` set to one of these tampe
 | `wrong-mode` | takes one `defaultEnabled` app out of `core/shipped.json` | `app '<id>' has mode default and must be enabled ... but it is disabled` |
 | `skip-enable` | empties the `ENABLE_APPS` list of the archive's `ncw-configure.sh` (needs a flavor with `enable_after_install`) | `app '<id>' has mode available and is listed in enable_after_install: it must be enabled ...` |
 | `brand` | appends the visible text `Nextcloud (added by ionos-smoke-break.sh)` to `core/templates/login.php` (it must end in HTML mode) | `brand check, page login: 1 occurrence(s) of the text "Nextcloud" outside the allow-list` |
+| `source-link` | replaces the notice template of the theme in the archive by one without the source link (both smoke tests: fresh install and upgrade) | `FAIL - source link: the personal page has 0 link(s) to <url> ... wanted exactly 1` |
 
 If the smoke test passes with a break, the run fails with "did not catch the break" (so a gate that proves nothing is a
 failure too). Scheduled runs have no such input and always use `none`; the tamper step also only runs for `workflow_dispatch`.
@@ -383,7 +402,7 @@ The same input as for the fresh-install test; each mode belongs to exactly one s
 | `removed-in-shipped` | puts the first app of `removed-apps.json` back into all three lists of `core/shipped.json` while its folder stays out of the tree: a flavor that forgot to remove an app | `occ upgrade` fails (exit 5): `The files of the app "firstrunwizard" were not correctly replaced before running the update` |
 | `no-buildnumber` | deletes `.buildnumber`, so the new tree has the old version and the upgrade has nothing to do | `after the upgrade the version is '33.0.9.1', expected '33.0.9.1.12' ... the upgrade did not take` |
 
-The fresh-install modes (`missing-app`, `extra-app`, `wrong-mode`, `skip-enable`, `brand`) only break the fresh-install job. If an upgrade test passes with a break the
+The fresh-install modes (`missing-app`, `extra-app`, `wrong-mode`, `skip-enable`, `brand`) only break the fresh-install job; `source-link` breaks every smoke job (they all run the brand probes), so each of them must fail. If an upgrade test passes with a break the
 run fails with "did not catch the break".
 
 ### What the brand check and the theme probes showed (local run on a real install)
@@ -414,8 +433,8 @@ The first IONOS theme, mail template and branding settings were run against the 
 - **`l10n/*.js` files of a theme replace the app's file** (the JS locator loads only the first it finds), so only the JSON (PHP-side) translations are overridden.
 - The defaults for the client download links and the iOS app id are Nextcloud's and show up in every page (`syncClientUrl`, the `apple-itunes-app` meta tag):
   set by the base config `13-clients.config.php`.
-- Upstream marketing that remains on the personal settings page is the development notice template (social links); the AGPL attribution stays.
-  Its override is the source-link change; the matching allow-list entries say so.
+- Upstream marketing that remained on the personal settings page was the development notice template (marketing PDF, social links). The theme
+  overrides that template (the source offer, see "Source link probe"); the matching allow-list entries are gone.
 
 ### What the first runs on dev-v33.0.9.5 showed
 
