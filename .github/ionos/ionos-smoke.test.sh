@@ -460,7 +460,7 @@ STUB
   local vj
   for vj in 'none' '{"kind":"dev",' '{"kind":"dev","server_commit":"a7505dc"}' '{"kind":"dev","server_commit":"A7505DC9F871B335102DDB5770604C8E2860B919"}' '{"kind":"release","base_release":"33.0.9"}' '{"kind":"release","base_release":"33/../1","release_number":3}' '{"kind":"release","base_release":"33.0.9","release_number":"3"}' '{"kind":"release","base_release":"33.0.9","release_number":0}' '{"kind":"nightly","server_commit":"a7505dc9f871b335102ddb5770604c8e2860b919"}' '[1]'; do
     brand_world bw27 ionos
-    if [ "$vj" = none ]; then rm -f "$BW/tree/version.json"; else printf 'a7505dc9f871b335102ddb5770604c8e2860b919\n' "$vj" > "$BW/tree/version.json"; fi
+    if [ "$vj" = none ]; then rm -f "$BW/tree/version.json"; else printf '%s\n' "$vj" > "$BW/tree/version.json"; fi
     brand_run d27 MOCK_THEME=ionos MOCK_SOURCE_LINK="$SRC_REPO"
     check "version.json '$vj': the plain repository is expected" bash -c "test '$(status d27)' = 0 && grep -q 'ok - source link: the personal page links $SRC_REPO exactly once' '$ROOT/d27.log'"
   done
